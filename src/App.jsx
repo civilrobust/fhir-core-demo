@@ -1,513 +1,497 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 /**
- * FHIR = Fast Healthcare Interoperability Resources
- * HL7 = Health Level Seven
- *
- * Demo server (public): HAPI FHIR R4
+ * Acronyms explained (as requested):
+ * - NHS = National Health Service
+ * - FHIR = Fast Healthcare Interoperability Resources
+ * - REST = Representational State Transfer
+ * - JSON = JavaScript Object Notation
+ * - UI = User Interface
+ * - AI = Artificial Intelligence
  */
+
 const FHIR_BASE = "https://hapi.fhir.org/baseR4";
+const PATIENT_SEARCH = `${FHIR_BASE}/Patient`;
+const OBS_SEARCH = `${FHIR_BASE}/Observation`;
 
-function safeText(x) {
-  return typeof x === "string" ? x : "";
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toISOString().slice(0, 10);
 }
 
-function pickPatientName(patient) {
-  const n = patient?.name?.[0];
-  if (!n) return "Unnamed patient";
-  if (n.text) return n.text;
-  const given = Array.isArray(n.given) ? n.given.join(" ") : "";
-  const family = n.family ? String(n.family) : "";
-  return `${given} ${family}`.trim() || "Unnamed patient";
+function fmtDateTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
 }
 
-function pickPhone(patient) {
-  const t = (patient?.telecom || []).find((x) => x?.system === "phone");
-  return t?.value ? String(t.value) : "—";
+function getHumanName(patient) {
+  const name = patient?.name?.[0];
+  if (!name) return "Unnamed patient";
+  const given = Array.isArray(name.given) ? name.given.join(" ") : "";
+  const family = name.family || "";
+  const full = `${given} ${family}`.trim();
+  return full || "Unnamed patient";
 }
 
-function pickIdentifier(patient) {
-  const id = patient?.identifier?.[0]?.value;
-  return id ? String(id) : "—";
+function getTelecom(patient) {
+  const telecom = patient?.telecom || [];
+  const phone = telecom.find((t) => t.system === "phone")?.value;
+  const email = telecom.find((t) => t.system === "email")?.value;
+  return { phone, email };
 }
 
-function pickGender(patient) {
-  return patient?.gender ? String(patient.gender) : "—";
+function safeText(s) {
+  if (s === null || s === undefined) return "—";
+  const t = String(s).trim();
+  return t.length ? t : "—";
 }
 
-function pickBirthDate(patient) {
-  return patient?.birthDate ? String(patient.birthDate) : "—";
-}
-
-function formatWhen(obs) {
-  const dt =
-    obs?.effectiveDateTime ||
-    obs?.effectivePeriod?.start ||
-    obs?.issued ||
-    "";
-  if (!dt) return "—";
-  // keep it simple + readable
-  try {
-    const d = new Date(dt);
-    if (Number.isNaN(d.getTime())) return String(dt);
-    return d.toLocaleString();
-  } catch {
-    return String(dt);
-  }
-}
-
-function getObsDisplay(obs) {
-  const code = obs?.code;
-  const text =
-    code?.text ||
-    code?.coding?.[0]?.display ||
-    code?.coding?.[0]?.code ||
-    "Observation";
-  return String(text);
-}
-
-function getObsValueText(obs) {
-  // blood pressure often arrives as components
-  const comps = obs?.component;
-  if (Array.isArray(comps) && comps.length) {
-    const sys = comps.find((c) =>
-      (c?.code?.coding || []).some((k) => k?.code === "8480-6") // Systolic
-    );
-    const dia = comps.find((c) =>
-      (c?.code?.coding || []).some((k) => k?.code === "8462-4") // Diastolic
-    );
-    const sysV = sys?.valueQuantity?.value;
-    const diaV = dia?.valueQuantity?.value;
-    const unit =
-      sys?.valueQuantity?.unit ||
-      dia?.valueQuantity?.unit ||
-      "mmHg";
-    if (sysV != null && diaV != null) return `${sysV}/${diaV} ${unit}`;
-  }
-
-  const vq = obs?.valueQuantity;
-  if (vq?.value != null) {
-    const unit = vq.unit || vq.code || "";
-    return `${vq.value}${unit ? " " + unit : ""}`.trim();
-  }
-
-  if (obs?.valueString) return String(obs.valueString);
-  if (obs?.valueCodeableConcept?.text) return String(obs.valueCodeableConcept.text);
-
-  return "—";
+function pickObsDate(o) {
+  return o?.effectiveDateTime || o?.effectivePeriod?.start || o?.issued || null;
 }
 
 /**
- * Try to recognise common vital signs / labs.
- * We use a mix of well-known LOINC codes + fallback text matching (demo-friendly).
+ * Observation parsing:
+ * - Blood pressure often comes as components (systolic / diastolic)
+ * - Others come as valueQuantity / valueString
  */
-function classifyObservation(obs) {
-  const coding = obs?.code?.coding || [];
-  const codes = new Set(coding.map((c) => String(c.code || "")));
+function obsToDisplay(o) {
+  const codeText =
+    o?.code?.text ||
+    o?.code?.coding?.[0]?.display ||
+    o?.code?.coding?.[0]?.code ||
+    "Observation";
 
-  const text = (getObsDisplay(obs) + " " + (coding?.[0]?.display || "")).toLowerCase();
-
-  // Blood pressure panel
-  if (codes.has("85354-9") || codes.has("55284-4") || text.includes("blood pressure")) return "bp";
-
-  // Heart rate
-  if (codes.has("8867-4") || text.includes("heart rate") || text.includes("pulse")) return "hr";
-
-  // Temperature
-  if (codes.has("8310-5") || text.includes("temperature") || text.includes("temp")) return "temp";
-
-  // Oxygen saturation
-  if (codes.has("59408-5") || text.includes("oxygen saturation") || text.includes("spo2")) return "spo2";
-
-  // Haemoglobin
-  if (codes.has("718-7") || text.includes("hemoglobin") || text.includes("haemoglobin")) return "hgb";
-
-  // Weight
-  if (codes.has("29463-7") || codes.has("3141-9") || text.includes("weight")) return "wt";
-
-  return "other";
-}
-
-function pickLatestByType(observations) {
-  // Observations are fetched sorted newest-first; we pick first seen per type.
-  const latest = {};
-  for (const obs of observations) {
-    const t = classifyObservation(obs);
-    if (!latest[t]) latest[t] = obs;
+  // blood pressure (component-based)
+  if (o?.component?.length) {
+    const sys = o.component.find((c) => c?.code?.coding?.some((x) => x.code === "8480-6"));
+    const dia = o.component.find((c) => c?.code?.coding?.some((x) => x.code === "8462-4"));
+    const sysV = sys?.valueQuantity?.value;
+    const diaV = dia?.valueQuantity?.value;
+    if (sysV != null && diaV != null) {
+      return {
+        label: "Blood pressure",
+        value: `${sysV}/${diaV} mmHg`,
+        when: fmtDateTime(pickObsDate(o)),
+        kind: "bp",
+        raw: { sys: Number(sysV), dia: Number(diaV) },
+      };
+    }
   }
-  return latest;
+
+  // quantity-based
+  if (o?.valueQuantity?.value != null) {
+    const v = o.valueQuantity.value;
+    const u = o.valueQuantity.unit || o.valueQuantity.code || "";
+    return {
+      label: codeText,
+      value: `${v} ${u}`.trim(),
+      when: fmtDateTime(pickObsDate(o)),
+      kind: "qty",
+      raw: { value: Number(v), unit: u, codeText },
+    };
+  }
+
+  // string / codeable concept
+  if (o?.valueString) {
+    return { label: codeText, value: o.valueString, when: fmtDateTime(pickObsDate(o)), kind: "txt" };
+  }
+  const vcc = o?.valueCodeableConcept?.text || o?.valueCodeableConcept?.coding?.[0]?.display;
+  if (vcc) {
+    return { label: codeText, value: vcc, when: fmtDateTime(pickObsDate(o)), kind: "txt" };
+  }
+
+  return { label: codeText, value: "—", when: fmtDateTime(pickObsDate(o)), kind: "unknown" };
 }
 
-function aiSummaryFrom(patient, latest) {
-  const name = pickPatientName(patient);
-  const gender = pickGender(patient);
-  const dob = pickBirthDate(patient);
+/**
+ * AI heuristics (local demo AI):
+ * - Generates:
+ *   1) AI Alerts (red/amber/green)
+ *   2) AI Next Actions
+ *   3) AI Data Quality checks
+ *   4) A short "clinical narrative" summary
+ */
+function buildAiInsights({ patient, obsDisplays }) {
+  const name = getHumanName(patient);
+  const gender = safeText(patient?.gender);
+  const dob = safeText(patient?.birthDate);
 
-  const lines = [];
-  lines.push(`Patient: ${name} (gender: ${gender}, date of birth: ${dob})`);
+  // pick latest values by label
+  const byLabel = new Map();
+  for (const o of obsDisplays) {
+    const key = String(o.label || "").toLowerCase();
+    if (!byLabel.has(key)) byLabel.set(key, []);
+    byLabel.get(key).push(o);
+  }
+  for (const [k, arr] of byLabel) {
+    arr.sort((a, b) => (new Date(b.when).getTime() || 0) - (new Date(a.when).getTime() || 0));
+    byLabel.set(k, arr);
+  }
 
-  const vitals = [];
-  if (latest.bp) vitals.push(`Blood pressure: ${getObsValueText(latest.bp)} (${formatWhen(latest.bp)})`);
-  if (latest.hr) vitals.push(`Heart rate: ${getObsValueText(latest.hr)} (${formatWhen(latest.hr)})`);
-  if (latest.temp) vitals.push(`Temperature: ${getObsValueText(latest.temp)} (${formatWhen(latest.temp)})`);
-  if (latest.spo2) vitals.push(`Oxygen saturation: ${getObsValueText(latest.spo2)} (${formatWhen(latest.spo2)})`);
-  if (latest.hgb) vitals.push(`Haemoglobin: ${getObsValueText(latest.hgb)} (${formatWhen(latest.hgb)})`);
-  if (latest.wt) vitals.push(`Weight: ${getObsValueText(latest.wt)} (${formatWhen(latest.wt)})`);
+  const findLatest = (pred) => {
+    const flat = [...obsDisplays].slice();
+    flat.sort((a, b) => (new Date(b.when).getTime() || 0) - (new Date(a.when).getTime() || 0));
+    return flat.find(pred);
+  };
 
-  if (vitals.length) {
-    lines.push("");
-    lines.push("Latest observations:");
-    for (const v of vitals) lines.push(`• ${v}`);
+  const bp = findLatest((x) => x.kind === "bp");
+  const hr = findLatest((x) => String(x.label).toLowerCase().includes("heart rate"));
+  const spo2 = findLatest((x) => String(x.label).toLowerCase().includes("oxygen"));
+  const temp = findLatest((x) => String(x.label).toLowerCase().includes("temp"));
+
+  const alerts = [];
+  const actions = [];
+  const dq = [];
+
+  // Data quality checks
+  if (!patient?.id) dq.push("Patient ID missing.");
+  if (!patient?.name?.length) dq.push("No Patient name available in resource.");
+  if (!patient?.birthDate) dq.push("Date of birth missing.");
+  if (!obsDisplays.length) dq.push("No Observation resources returned for this patient.");
+
+  // Simple thresholds (demo only)
+  if (bp?.raw?.sys != null && bp?.raw?.dia != null) {
+    const { sys, dia } = bp.raw;
+    if (sys >= 180 || dia >= 120) alerts.push({ level: "red", text: `Very high blood pressure (${sys}/${dia}).` });
+    else if (sys >= 140 || dia >= 90) alerts.push({ level: "amber", text: `Raised blood pressure (${sys}/${dia}).` });
+    else alerts.push({ level: "green", text: `Blood pressure appears within typical range (${sys}/${dia}).` });
   } else {
-    lines.push("");
-    lines.push("Latest observations: none returned by the demo server for this patient.");
+    alerts.push({ level: "amber", text: "No blood pressure available in latest Observations." });
   }
 
-  // Very simple “flags” (purely demo logic)
-  const flags = [];
-
-  // temp > 37.8
-  if (latest.temp?.valueQuantity?.value != null) {
-    const t = Number(latest.temp.valueQuantity.value);
-    if (!Number.isNaN(t) && t >= 37.8) flags.push("Raised temperature recorded.");
-  }
-  // spo2 < 94
-  if (latest.spo2?.valueQuantity?.value != null) {
-    const s = Number(latest.spo2.valueQuantity.value);
-    if (!Number.isNaN(s) && s < 94) flags.push("Low oxygen saturation recorded.");
-  }
-  // HR > 100
-  if (latest.hr?.valueQuantity?.value != null) {
-    const h = Number(latest.hr.valueQuantity.value);
-    if (!Number.isNaN(h) && h > 100) flags.push("Raised heart rate recorded.");
+  if (hr?.raw?.value != null) {
+    const v = hr.raw.value;
+    if (v >= 130) alerts.push({ level: "red", text: `High heart rate (${v}).` });
+    else if (v >= 100) alerts.push({ level: "amber", text: `Raised heart rate (${v}).` });
+    else if (v > 0) alerts.push({ level: "green", text: `Heart rate looks stable (${v}).` });
+  } else {
+    alerts.push({ level: "amber", text: "No heart rate available in latest Observations." });
   }
 
-  if (flags.length) {
-    lines.push("");
-    lines.push("Attention flags:");
-    for (const f of flags) lines.push(`• ${f}`);
+  if (spo2?.raw?.value != null) {
+    const v = spo2.raw.value;
+    if (v < 90) alerts.push({ level: "red", text: `Low oxygen saturation (${v}).` });
+    else if (v < 94) alerts.push({ level: "amber", text: `Borderline oxygen saturation (${v}).` });
+    else alerts.push({ level: "green", text: `Oxygen saturation looks OK (${v}).` });
   }
 
-  lines.push("");
-  lines.push("Summary generated locally for demo purposes (no external AI call).");
+  if (temp?.raw?.value != null) {
+    const v = temp.raw.value;
+    if (v >= 39) alerts.push({ level: "red", text: `High temperature (${v}).` });
+    else if (v >= 37.8) alerts.push({ level: "amber", text: `Raised temperature (${v}).` });
+    else alerts.push({ level: "green", text: `Temperature looks normal (${v}).` });
+  }
 
-  return lines.join("\n");
+  // Next Actions (demo)
+  actions.push("Review latest Observations and confirm timestamps match the current encounter.");
+  actions.push("Check for missing vitals (blood pressure, heart rate, temperature, oxygen saturation).");
+  actions.push("If trends look unusual, pull additional Observations and display a mini chart (sparkline).");
+  actions.push("Add MedicationRequest resources and Conditions to build an AI ‘patient story’ timeline.");
+
+  // Narrative summary (demo)
+  const latestFew = [...obsDisplays]
+    .slice()
+    .sort((a, b) => (new Date(b.when).getTime() || 0) - (new Date(a.when).getTime() || 0))
+    .slice(0, 5);
+
+  const summaryLines = [];
+  summaryLines.push(`Patient: ${name} • Gender: ${gender} • Date of birth: ${dob}`);
+  summaryLines.push("");
+  summaryLines.push("AI clinical narrative (demo):");
+  summaryLines.push(
+    `Latest data includes ${obsDisplays.length} Observations. Key recent items: ` +
+      (latestFew.length
+        ? latestFew.map((x) => `${x.label}: ${x.value} (${x.when})`).join(" • ")
+        : "no recent items.")
+  );
+  summaryLines.push("");
+  summaryLines.push("AI alerts:");
+  for (const a of alerts) summaryLines.push(`- [${a.level.toUpperCase()}] ${a.text}`);
+  summaryLines.push("");
+  summaryLines.push("AI next actions:");
+  for (const a of actions) summaryLines.push(`- ${a}`);
+  if (dq.length) {
+    summaryLines.push("");
+    summaryLines.push("AI data-quality checks:");
+    for (const d of dq) summaryLines.push(`- ${d}`);
+  }
+
+  return { alerts, actions, dq, narrative: summaryLines.join("\n") };
 }
 
-const ui = {
-  page: {
-    minHeight: "100vh",
-    background: "linear-gradient(180deg, #eef5ff 0%, #ffffff 55%)",
-    padding: 28,
-    fontFamily:
-      'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"',
-    color: "#0b1b2b",
-  },
-  shell: {
-    maxWidth: 1200,
-    margin: "0 auto",
-  },
-  topBar: {
-    borderRadius: 14,
-    padding: "14px 16px",
-    background: "linear-gradient(90deg, #0b63ce 0%, #1479e6 60%, #0b63ce 100%)",
-    color: "white",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    boxShadow: "0 10px 30px rgba(11, 99, 206, 0.25)",
-  },
-  titleRow: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },
-  title: { fontSize: 16, fontWeight: 900, letterSpacing: 0.2 },
-  chip: {
-    background: "rgba(255,255,255,0.18)",
-    border: "1px solid rgba(255,255,255,0.28)",
-    padding: "4px 10px",
-    borderRadius: 999,
-    fontSize: 12,
-    fontWeight: 700,
-  },
-  card: {
-    background: "rgba(255,255,255,0.9)",
-    border: "1px solid rgba(11, 27, 43, 0.10)",
-    borderRadius: 16,
-    boxShadow: "0 12px 28px rgba(11, 27, 43, 0.10)",
-  },
-  section: { marginTop: 16, padding: 18 },
-  h2: { margin: 0, fontSize: 22, fontWeight: 900 },
-  subtle: { opacity: 0.75, fontSize: 13, marginTop: 6 },
-  pills: { display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 },
-  pill: {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 8,
-    padding: "6px 10px",
-    borderRadius: 999,
-    border: "1px solid rgba(11, 27, 43, 0.12)",
-    background: "white",
-    fontSize: 12,
-    fontWeight: 700,
-  },
-  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 },
-  inputsRow: {
-    display: "grid",
-    gridTemplateColumns: "1.2fr 0.4fr 0.4fr",
-    gap: 12,
-    alignItems: "end",
-    marginTop: 12,
-  },
-  label: { fontSize: 12, fontWeight: 800, opacity: 0.75, marginBottom: 6 },
-  input: {
-    width: "100%",
-    padding: "10px 12px",
-    borderRadius: 12,
-    border: "1px solid rgba(11, 27, 43, 0.16)",
-    outline: "none",
-    fontSize: 13,
-    background: "white",
-  },
-  button: {
-    padding: "10px 14px",
-    borderRadius: 12,
-    border: "1px solid rgba(11, 99, 206, 0.25)",
-    background: "#0b63ce",
-    color: "white",
-    fontWeight: 900,
-    cursor: "pointer",
-    boxShadow: "0 12px 20px rgba(11, 99, 206, 0.25)",
-  },
-  layout: { display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 14, marginTop: 14 },
-  listHeader: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "baseline",
-    marginBottom: 10,
-  },
-  listTitle: { fontWeight: 900 },
-  smallCount: { fontSize: 12, opacity: 0.65 },
-  patientCard: (active) => ({
-    borderRadius: 14,
-    border: active ? "1px solid rgba(11, 99, 206, 0.55)" : "1px solid rgba(11, 27, 43, 0.10)",
-    background: active ? "rgba(11, 99, 206, 0.06)" : "white",
-    padding: 14,
-    marginBottom: 10,
-    cursor: "pointer",
-    boxShadow: active ? "0 10px 22px rgba(11, 99, 206, 0.12)" : "none",
-  }),
-  rowBetween: { display: "flex", justifyContent: "space-between", gap: 10 },
-  patientName: { fontSize: 16, fontWeight: 900 },
-  meta: { fontSize: 12, opacity: 0.7, marginTop: 2 },
-  rightMeta: { textAlign: "right", fontSize: 12, opacity: 0.8 },
-  vitalsGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 },
-  vitalCard: {
-    padding: 10,
-    borderRadius: 14,
-    border: "1px solid rgba(11, 27, 43, 0.10)",
-    background: "white",
-  },
-  vitalLabel: { fontSize: 11, fontWeight: 900, opacity: 0.7 },
-  vitalValue: { fontSize: 18, fontWeight: 950, marginTop: 4 },
-  vitalWhen: { fontSize: 11, opacity: 0.6, marginTop: 4 },
-  timeline: {
-    marginTop: 10,
-    borderRadius: 14,
-    border: "1px solid rgba(11, 27, 43, 0.10)",
-    background: "white",
-    overflow: "hidden",
-  },
-  tlItem: {
-    display: "flex",
-    justifyContent: "space-between",
-    gap: 12,
-    padding: "10px 12px",
-    borderTop: "1px solid rgba(11, 27, 43, 0.06)",
-  },
-  tlLeft: { fontSize: 12, fontWeight: 800 },
-  tlSub: { fontSize: 11, opacity: 0.6, marginTop: 2 },
-  tlRight: { fontSize: 12, fontWeight: 900, whiteSpace: "nowrap" },
-  aiBox: {
-    marginTop: 12,
-    borderRadius: 14,
-    border: "1px solid rgba(11, 27, 43, 0.10)",
-    background: "white",
-    padding: 12,
-  },
-  aiText: {
-    marginTop: 10,
-    whiteSpace: "pre-wrap",
-    fontFamily:
-      'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-    fontSize: 12,
-    lineHeight: 1.45,
-    borderRadius: 12,
-    border: "1px solid rgba(11, 27, 43, 0.10)",
-    padding: 10,
-    background: "rgba(11,99,206,0.03)",
-    maxHeight: 220,
-    overflow: "auto",
-  },
-};
+/**
+ * OPTIONAL real AI hook:
+ * - If you later build a tiny backend endpoint, you can send patient+observations to it.
+ * - This keeps the demo “AI-heavy” but also board-safe and controllable.
+ *
+ * Set in .env.local:
+ *   VITE_AI_ENDPOINT=https://your-backend.example/ai/summary
+ */
+async function callRealAiEndpoint({ patient, observations }) {
+  const endpoint = import.meta.env.VITE_AI_ENDPOINT;
+  if (!endpoint) return null;
+
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ patient, observations }),
+  });
+
+  if (!res.ok) throw new Error(`AI endpoint error: ${res.status}`);
+  const data = await res.json();
+  // expected: { summaryText: "..." }
+  return data?.summaryText || null;
+}
+
+function VitalCard({ label, value, when }) {
+  return (
+    <div className="obsCard">
+      <div className="obsLabel">{label}</div>
+      <div className="obsValue">{value}</div>
+      <div className="obsWhen">{when}</div>
+    </div>
+  );
+}
+
+function levelDotClass(level) {
+  if (level === "green") return "dot dotGreen";
+  if (level === "amber") return "dot dotAmber";
+  if (level === "red") return "dot dotRed";
+  return "dot";
+}
 
 export default function App() {
-  const [query, setQuery] = useState("smith");
+  const [nameContains, setNameContains] = useState("smith");
   const [count, setCount] = useState(10);
 
   const [loadingPatients, setLoadingPatients] = useState(false);
   const [patients, setPatients] = useState([]);
-  const [errorPatients, setErrorPatients] = useState("");
+  const [patientsErr, setPatientsErr] = useState("");
 
   const [selectedPatient, setSelectedPatient] = useState(null);
+
   const [loadingObs, setLoadingObs] = useState(false);
-  const [observations, setObservations] = useState([]);
-  const [errorObs, setErrorObs] = useState("");
+  const [obs, setObs] = useState([]);
+  const [obsErr, setObsErr] = useState("");
 
   const [aiSummary, setAiSummary] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [useRealAi, setUseRealAi] = useState(false);
 
   async function searchPatients() {
     setLoadingPatients(true);
-    setErrorPatients("");
-    setAiSummary("");
-    try {
-      const url = `${FHIR_BASE}/Patient?name=${encodeURIComponent(query)}&_count=${encodeURIComponent(
-        String(count || 10)
-      )}`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`Patient search failed (${res.status})`);
-      const bundle = await res.json();
-      const list = (bundle?.entry || []).map((e) => e.resource).filter(Boolean);
-      setPatients(list);
+    setPatientsErr("");
+    setPatients([]);
 
-      if (list.length) {
-        setSelectedPatient(list[0]);
-      } else {
-        setSelectedPatient(null);
-        setObservations([]);
-      }
+    try {
+      const url =
+        `${PATIENT_SEARCH}?` +
+        new URLSearchParams({
+          name: nameContains || "",
+          _count: String(count || 10),
+        }).toString();
+
+      const res = await fetch(url, { headers: { Accept: "application/fhir+json" } });
+      if (!res.ok) throw new Error(`FHIR patient search failed: ${res.status}`);
+
+      const bundle = await res.json();
+      const entries = bundle?.entry || [];
+      const pts = entries.map((e) => e.resource).filter(Boolean);
+      setPatients(pts);
+
+      if (pts.length) setSelectedPatient(pts[0]);
+      else setSelectedPatient(null);
     } catch (e) {
-      setErrorPatients(e?.message || "Failed to search patients.");
-      setPatients([]);
+      setPatientsErr(e?.message || "Unknown error searching patients.");
       setSelectedPatient(null);
-      setObservations([]);
     } finally {
       setLoadingPatients(false);
     }
   }
 
-  async function fetchObservationsForPatient(patient) {
-    if (!patient?.id) return;
+  async function fetchObservationsForPatient(patientId) {
+    if (!patientId) return;
     setLoadingObs(true);
-    setErrorObs("");
+    setObsErr("");
+    setObs([]);
     setAiSummary("");
+
     try {
-      // Try patient= first (common); if empty, fallback to subject=Patient/{id}
-      const url1 = `${FHIR_BASE}/Observation?patient=${encodeURIComponent(
-        patient.id
-      )}&_sort=-date&_count=50`;
-      const res1 = await fetch(url1);
-      if (!res1.ok) throw new Error(`Observation fetch failed (${res1.status})`);
-      const bundle1 = await res1.json();
-      let obs = (bundle1?.entry || []).map((e) => e.resource).filter(Boolean);
+      const url =
+        `${OBS_SEARCH}?` +
+        new URLSearchParams({
+          subject: `Patient/${patientId}`,
+          _sort: "-date",
+          _count: "25",
+        }).toString();
 
-      if (!obs.length) {
-        const url2 = `${FHIR_BASE}/Observation?subject=Patient/${encodeURIComponent(
-          patient.id
-        )}&_sort=-date&_count=50`;
-        const res2 = await fetch(url2);
-        if (res2.ok) {
-          const bundle2 = await res2.json();
-          obs = (bundle2?.entry || []).map((e) => e.resource).filter(Boolean);
-        }
-      }
+      const res = await fetch(url, { headers: { Accept: "application/fhir+json" } });
+      if (!res.ok) throw new Error(`FHIR Observation search failed: ${res.status}`);
 
-      setObservations(obs);
+      const bundle = await res.json();
+      const entries = bundle?.entry || [];
+      const items = entries.map((e) => e.resource).filter(Boolean);
+      setObs(items);
     } catch (e) {
-      setErrorObs(e?.message || "Failed to fetch observations.");
-      setObservations([]);
+      setObsErr(e?.message || "Unknown error fetching Observations.");
     } finally {
       setLoadingObs(false);
     }
   }
 
+  // initial load
   useEffect(() => {
-    // initial load
     searchPatients();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // load observations when selection changes
   useEffect(() => {
-    // load observations when selection changes
-    if (selectedPatient?.id) fetchObservationsForPatient(selectedPatient);
+    if (selectedPatient?.id) fetchObservationsForPatient(selectedPatient.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPatient?.id]);
 
-  const latest = useMemo(() => pickLatestByType(observations), [observations]);
+  const patientTelecom = useMemo(() => getTelecom(selectedPatient), [selectedPatient]);
 
-  function VitalCard({ label, obs }) {
-    return (
-      <div style={ui.vitalCard}>
-        <div style={ui.vitalLabel}>{label}</div>
-        <div style={ui.vitalValue}>{obs ? getObsValueText(obs) : "—"}</div>
-        <div style={ui.vitalWhen}>{obs ? formatWhen(obs) : "—"}</div>
-      </div>
-    );
-  }
+  const obsDisplays = useMemo(() => obs.map(obsToDisplay), [obs]);
 
-  function onSelect(p) {
-    setSelectedPatient(p);
-  }
+  // curated “vitals-like” cards for the top area
+  const vitalsCards = useMemo(() => {
+    const latestByKey = new Map();
 
-  function onGenerateSummary() {
+    const wantKeys = [
+      { key: "Blood pressure", pred: (x) => x.kind === "bp" },
+      { key: "Heart rate", pred: (x) => String(x.label).toLowerCase().includes("heart rate") },
+      { key: "Temperature", pred: (x) => String(x.label).toLowerCase().includes("temp") },
+      { key: "Oxygen saturation", pred: (x) => String(x.label).toLowerCase().includes("oxygen") },
+    ];
+
+    const sorted = [...obsDisplays].slice().sort((a, b) => {
+      const ta = new Date(a.when).getTime() || 0;
+      const tb = new Date(b.when).getTime() || 0;
+      return tb - ta;
+    });
+
+    for (const item of sorted) {
+      for (const w of wantKeys) {
+        if (latestByKey.has(w.key)) continue;
+        if (w.pred(item)) latestByKey.set(w.key, item);
+      }
+      if (latestByKey.size === wantKeys.length) break;
+    }
+
+    return wantKeys.map((w) => {
+      const it = latestByKey.get(w.key);
+      return {
+        label: w.key,
+        value: it?.value || "—",
+        when: it?.when || "—",
+      };
+    });
+  }, [obsDisplays]);
+
+  const timelineItems = useMemo(() => {
+    const sorted = [...obsDisplays].slice().sort((a, b) => {
+      const ta = new Date(a.when).getTime() || 0;
+      const tb = new Date(b.when).getTime() || 0;
+      return tb - ta;
+    });
+    return sorted.slice(0, 10);
+  }, [obsDisplays]);
+
+  const aiInsights = useMemo(() => {
+    if (!selectedPatient) return null;
+    return buildAiInsights({ patient: selectedPatient, obsDisplays });
+  }, [selectedPatient, obsDisplays]);
+
+  async function generateAiSummary() {
     if (!selectedPatient) return;
-    const text = aiSummaryFrom(selectedPatient, latest);
-    setAiSummary(text);
+
+    setAiBusy(true);
+    setAiSummary("");
+
+    try {
+      // 1) If “Real AI” toggle enabled AND endpoint exists, call it
+      if (useRealAi) {
+        const txt = await callRealAiEndpoint({ patient: selectedPatient, observations: obs });
+        if (txt) {
+          setAiSummary(txt);
+          return;
+        }
+      }
+
+      // 2) Otherwise use local AI heuristics (still “AI” in the demo sense)
+      const local = buildAiInsights({ patient: selectedPatient, obsDisplays });
+      setAiSummary(local.narrative);
+    } catch (e) {
+      setAiSummary(`AI summary failed: ${e?.message || "Unknown error"}`);
+    } finally {
+      setAiBusy(false);
+    }
   }
 
   return (
-    <div style={ui.page}>
-      <div style={ui.shell}>
-        <div style={ui.topBar}>
-          <div style={ui.titleRow}>
-            <div style={ui.title}>Clinical FHIR Integration Demo</div>
-            <span style={ui.chip}>React + Vite</span>
-            <span style={ui.chip}>FHIR R4 (Release 4)</span>
+    <div className="page">
+      <div className="shell">
+        <div className="topBar">
+          <div className="brandLeft">
+            <div className="brandTitle">Clinical FHIR Integration Demo</div>
+            <div className="brandMeta">
+              Live FHIR (Fast Healthcare Interoperability Resources) REST (Representational State Transfer) calls •
+              React + Vite • Board-ready UI (User Interface)
+            </div>
           </div>
-          <div style={{ fontSize: 12, opacity: 0.95, fontWeight: 800 }}>
-            Test server:{" "}
-            <span style={{ textDecoration: "underline" }}>
-              {FHIR_BASE}
-            </span>
+
+          <div className="pills">
+            <div className="pill">React + Vite</div>
+            <div className="pill">FHIR R4 (Release 4)</div>
+            <a className="pill linkPill" href={FHIR_BASE} target="_blank" rel="noreferrer">
+              Test server: {FHIR_BASE}
+            </a>
           </div>
         </div>
 
-        <section style={{ ...ui.card, ...ui.section }}>
-          <div style={{ textAlign: "center" }}>
-            <h2 style={ui.h2}>Patient search</h2>
-            <div style={ui.subtle}>
-              Live FHIR REST calls returning FHIR JSON bundles, rendered into a clinical-style interface.
-            </div>
-
-            <div style={ui.pills}>
-              <span style={ui.pill}>✅ Public demo data</span>
-              <span style={ui.pill}>📎 Standards-based integration</span>
-              <span style={ui.pill}>☁️ Deployed on Cloudflare Pages</span>
-            </div>
+        {/* Search card */}
+        <div className="card cardPad" style={{ marginTop: 14 }}>
+          <div className="h1" style={{ textAlign: "center" }}>
+            Patient search
+          </div>
+          <div className="subtle" style={{ textAlign: "center", marginTop: 6 }}>
+            Searches Patient resources, then pulls Observation resources (vitals / labs) and generates an AI (Artificial
+            Intelligence) summary + alerts + next actions.
           </div>
 
-          <div style={ui.inputsRow}>
-            <div>
-              <div style={ui.label}>Name contains</div>
-              <input
-                style={ui.input}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="e.g. smith"
-              />
-            </div>
+          <div className="badgesRow">
+            <span className="badge">
+              <span className="dot dotGreen" /> Public demo data
+            </span>
+            <span className="badge">
+              <span className="dot" /> Standards-based integration
+            </span>
+            <span className="badge">
+              <span className="dot dotAmber" /> Deployed on Cloudflare Pages
+            </span>
+          </div>
 
+          <div className="searchGrid">
             <div>
-              <div style={ui.label}>Count</div>
+              <div className="label">Name contains</div>
+              <input className="input" value={nameContains} onChange={(e) => setNameContains(e.target.value)} />
+            </div>
+            <div>
+              <div className="label">Count</div>
               <input
-                style={ui.input}
+                className="input"
                 type="number"
                 min={1}
                 max={50}
@@ -515,165 +499,180 @@ export default function App() {
                 onChange={(e) => setCount(Number(e.target.value || 10))}
               />
             </div>
-
-            <div>
-              <div style={ui.label}>&nbsp;</div>
-              <button style={ui.button} onClick={searchPatients} disabled={loadingPatients}>
-                {loadingPatients ? "Searching…" : "Search"}
-              </button>
-            </div>
+            <button className="button" onClick={searchPatients} disabled={loadingPatients}>
+              {loadingPatients ? "Searching…" : "Search"}
+            </button>
           </div>
 
-          {(errorPatients || errorObs) && (
-            <div style={{ marginTop: 12, color: "#8a0000", fontWeight: 800 }}>
-              {safeText(errorPatients || errorObs)}
+          {patientsErr ? (
+            <div className="subtle" style={{ marginTop: 10, color: "rgba(210,30,45,0.95)", fontWeight: 900 }}>
+              {patientsErr}
             </div>
-          )}
+          ) : null}
+        </div>
 
-          <div style={ui.layout}>
-            {/* LEFT: Results */}
-            <div style={{ ...ui.card, padding: 14 }}>
-              <div style={ui.listHeader}>
-                <div style={ui.listTitle}>Results</div>
-                <div style={ui.smallCount}>
-                  {patients.length} patient{patients.length === 1 ? "" : "s"}
-                </div>
+        {/* Main grid */}
+        <div className="mainGrid">
+          {/* Results list */}
+          <div className="card list">
+            <div className="listHeader">
+              <div className="sectionTitle">Results</div>
+              <div className="countText">
+                {loadingPatients ? "Loading…" : `${patients.length} patient${patients.length === 1 ? "" : "s"}`}
               </div>
+            </div>
 
-              {patients.map((p) => {
+            {loadingPatients ? (
+              <div style={{ padding: 12 }}>
+                <div className="skel" style={{ width: "40%", margin: "10px 10px 0" }} />
+                <div className="skel" style={{ width: "90%", height: 52, margin: "10px" }} />
+                <div className="skel" style={{ width: "90%", height: 52, margin: "10px" }} />
+                <div className="skel" style={{ width: "90%", height: 52, margin: "10px" }} />
+              </div>
+            ) : patients.length === 0 ? (
+              <div className="subtle" style={{ padding: 14, fontWeight: 900 }}>
+                No patients returned.
+              </div>
+            ) : (
+              patients.map((p) => {
                 const active = selectedPatient?.id === p.id;
+                const { phone } = getTelecom(p);
                 return (
-                  <div key={p.id} style={ui.patientCard(active)} onClick={() => onSelect(p)}>
-                    <div style={ui.rowBetween}>
-                      <div>
-                        <div style={ui.patientName}>{pickPatientName(p)}</div>
-                        <div style={ui.meta}>Patient/{p.id}</div>
-                        <div style={{ ...ui.meta, marginTop: 6 }}>📞 Phone: {pickPhone(p)}</div>
-                      </div>
+                  <div
+                    key={p.id}
+                    className={`row ${active ? "rowActive" : ""}`}
+                    onClick={() => setSelectedPatient(p)}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <div>
+                      <div className="name">{getHumanName(p)}</div>
+                      <div className="small">Patient/{p.id}</div>
+                      <div className="phone">📞 Phone: {safeText(phone)}</div>
+                    </div>
 
-                      <div style={ui.rightMeta}>
-                        <div style={{ fontWeight: 900 }}>
-                          {p.gender || "unknown"} • {p.birthDate || "—"}
-                        </div>
-                        <div style={{ marginTop: 4, opacity: 0.7 }}>
-                          Identifier: {pickIdentifier(p)}
-                        </div>
+                    <div className="metaRight">
+                      <div>{safeText(p.gender)} • {fmtDate(p.birthDate)}</div>
+                      <div style={{ marginTop: 2 }}>
+                        Identifier: {safeText(p?.identifier?.[0]?.value)}
                       </div>
                     </div>
                   </div>
                 );
-              })}
+              })
+            )}
+          </div>
 
-              {!loadingPatients && patients.length === 0 && (
-                <div style={{ opacity: 0.75 }}>No patients returned.</div>
-              )}
+          {/* Details */}
+          <div className="card cardPad">
+            <div className="detailsHeader">
+              <div className="sectionTitle">Patient details</div>
+              <div className="detailsName">{selectedPatient ? getHumanName(selectedPatient) : "—"}</div>
+              <div className="small">{selectedPatient ? `Patient/${selectedPatient.id}` : "Select a patient"}</div>
             </div>
 
-            {/* RIGHT: Patient details */}
-            <div style={{ ...ui.card, padding: 14 }}>
-              <div style={{ textAlign: "center", fontWeight: 900 }}>Patient details</div>
+            <div className="kvRow">
+              <div className="kv">
+                <span>Gender</span>
+                <div>{safeText(selectedPatient?.gender)}</div>
+              </div>
+              <div className="kv">
+                <span>Date of birth</span>
+                <div>{fmtDate(selectedPatient?.birthDate)}</div>
+              </div>
+            </div>
 
-              {!selectedPatient ? (
-                <div style={{ marginTop: 12, opacity: 0.75, textAlign: "center" }}>
-                  Select a patient from the results.
+            {/* Observations */}
+            <div className="obsHeader">
+              <div className="sectionTitle">Observations (vitals / labs)</div>
+              <div className="countText">{loadingObs ? "Loading…" : `${obsDisplays.length} items`}</div>
+            </div>
+
+            {obsErr ? (
+              <div className="subtle" style={{ marginTop: 10, color: "rgba(210,30,45,0.95)", fontWeight: 900 }}>
+                {obsErr}
+              </div>
+            ) : null}
+
+            <div className="obsGrid">
+              {loadingObs
+                ? Array.from({ length: 4 }).map((_, i) => (
+                    <div key={i} className="obsCard">
+                      <div className="skel" style={{ width: "44%" }} />
+                      <div className="skel" style={{ width: "68%", height: 16, marginTop: 10 }} />
+                      <div className="skel" style={{ width: "52%", marginTop: 10 }} />
+                    </div>
+                  ))
+                : vitalsCards.map((v) => <VitalCard key={v.label} label={v.label} value={v.value} when={v.when} />)}
+            </div>
+
+            {/* Timeline */}
+            <div className="timelineTitle">Recent timeline</div>
+            {loadingObs ? (
+              <div style={{ marginTop: 8 }}>
+                <div className="skel" style={{ width: "100%", height: 44, borderRadius: 14, marginTop: 8 }} />
+                <div className="skel" style={{ width: "100%", height: 44, borderRadius: 14, marginTop: 8 }} />
+                <div className="skel" style={{ width: "100%", height: 44, borderRadius: 14, marginTop: 8 }} />
+              </div>
+            ) : (
+              timelineItems.map((t, idx) => (
+                <div key={`${t.label}-${idx}-${t.when}`} className="timelineItem">
+                  <div className="timelineLeft">
+                    <div className="timelineName">{t.label}</div>
+                    <div className="timelineWhen">{t.when}</div>
+                  </div>
+                  <div className="timelineRight">{t.value}</div>
                 </div>
-              ) : (
-                <>
-                  <div style={{ textAlign: "center", marginTop: 8 }}>
-                    <div style={{ fontSize: 18, fontWeight: 950 }}>
-                      {pickPatientName(selectedPatient)}
-                    </div>
-                    <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
-                      Patient/{selectedPatient.id}
-                    </div>
-                  </div>
+              ))
+            )}
 
-                  <div style={ui.grid2}>
-                    <div style={ui.pill}>
-                      <span style={{ opacity: 0.7 }}>Gender</span>
-                      <span style={{ fontWeight: 950 }}>{pickGender(selectedPatient)}</span>
-                    </div>
-                    <div style={ui.pill}>
-                      <span style={{ opacity: 0.7 }}>Date of birth</span>
-                      <span style={{ fontWeight: 950 }}>{pickBirthDate(selectedPatient)}</span>
-                    </div>
-                  </div>
+            {/* AI Panel */}
+            <div className="aiPanel">
+              <div className="aiHeader">
+                <div className="aiTitle">AI summary (demo)</div>
 
-                  <div style={{ marginTop: 12, display: "flex", justifyContent: "space-between" }}>
-                    <div style={{ fontWeight: 900 }}>Observations (vitals / labs)</div>
-                    <div style={{ fontSize: 12, opacity: 0.65 }}>
-                      {loadingObs ? "Loading…" : `${observations.length} items`}
-                    </div>
-                  </div>
+                <div className="aiMode" title="Toggle between local AI and a real AI endpoint (if configured)">
+                  Real AI endpoint
+                  <input
+                    className="toggle"
+                    type="checkbox"
+                    checked={useRealAi}
+                    onChange={(e) => setUseRealAi(e.target.checked)}
+                  />
+                </div>
+              </div>
 
-                  <div style={ui.vitalsGrid}>
-                    <VitalCard label="Blood pressure" obs={latest.bp} />
-                    <VitalCard label="Heart rate" obs={latest.hr} />
-                    <VitalCard label="Temperature" obs={latest.temp} />
-                    <VitalCard label="Oxygen saturation" obs={latest.spo2} />
-                  </div>
+              {/* AI Alerts chips */}
+              <div className="badgesRow" style={{ marginTop: 10 }}>
+                {(aiInsights?.alerts || []).slice(0, 4).map((a, i) => (
+                  <span key={i} className="badge">
+                    <span className={levelDotClass(a.level)} /> {a.text}
+                  </span>
+                ))}
+              </div>
 
-                  <div style={{ marginTop: 12, fontWeight: 900, textAlign: "center" }}>
-                    Recent timeline
-                  </div>
+              <div className="aiRow">
+                <button className="aiBtn" onClick={generateAiSummary} disabled={aiBusy || !selectedPatient}>
+                  {aiBusy ? "Generating…" : "Generate summary"}
+                </button>
+                <div className="aiMini">
+                  Generates a short “clinical note” from Patient demographics + latest Observations.
+                </div>
+              </div>
 
-                  <div style={ui.timeline}>
-                    {observations.slice(0, 8).map((o) => (
-                      <div key={o.id} style={ui.tlItem}>
-                        <div style={{ minWidth: 0 }}>
-                          <div style={ui.tlLeft}>{getObsDisplay(o)}</div>
-                          <div style={ui.tlSub}>{formatWhen(o)}</div>
-                        </div>
-                        <div style={ui.tlRight}>{getObsValueText(o)}</div>
-                      </div>
-                    ))}
+              <div className="aiTextBox">
+                {aiSummary
+                  ? aiSummary
+                  : "Click “Generate summary” to produce an AI clinical narrative + alerts + next actions + data quality checks."}
+              </div>
+            </div>
 
-                    {observations.length === 0 && (
-                      <div style={{ padding: 12, opacity: 0.75 }}>
-                        No observations returned for this patient.
-                      </div>
-                    )}
-                  </div>
-
-                  {/* AI Summary Panel */}
-                  <div style={ui.aiBox}>
-                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                      <div style={{ fontWeight: 950 }}>AI summary (demo)</div>
-                      <button
-                        style={{
-                          ...ui.button,
-                          padding: "8px 12px",
-                          borderRadius: 10,
-                          boxShadow: "0 10px 16px rgba(11, 99, 206, 0.18)",
-                        }}
-                        onClick={onGenerateSummary}
-                        disabled={!selectedPatient}
-                      >
-                        Generate summary
-                      </button>
-                    </div>
-
-                    <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
-                      Generates a short “clinical note” from patient demographics + latest observations.
-                    </div>
-
-                    {aiSummary ? (
-                      <div style={ui.aiText}>{aiSummary}</div>
-                    ) : (
-                      <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-                        Click <b>Generate summary</b> to produce a narrative.
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
+            <div className="subtle" style={{ marginTop: 12, textAlign: "center", fontWeight: 900 }}>
+              Next upgrade: add mini sparklines + Conditions + MedicationRequests + Encounter timeline for a full AI patient
+              story.
             </div>
           </div>
-        </section>
-
-        <footer style={{ marginTop: 14, opacity: 0.65, fontSize: 12, textAlign: "center" }}>
-          Tip: after you <b>git push</b>, Cloudflare Pages will rebuild automatically if this repo is connected.
-        </footer>
+        </div>
       </div>
     </div>
   );
