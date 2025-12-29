@@ -20,9 +20,12 @@ function getFirstTelecom(telecomArr, system) {
 export default function App() {
   const [q, setQ] = useState("smith");
   const [count, setCount] = useState(10);
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [bundle, setBundle] = useState(null);
+
+  const [selectedPatientId, setSelectedPatientId] = useState("");
 
   const patients = useMemo(() => {
     const entries = bundle?.entry || [];
@@ -30,6 +33,10 @@ export default function App() {
       .map((e) => e.resource)
       .filter((r) => r && r.resourceType === "Patient");
   }, [bundle]);
+
+  const selectedPatient = useMemo(() => {
+    return patients.find((p) => p.id === selectedPatientId) || null;
+  }, [patients, selectedPatientId]);
 
   async function searchPatients() {
     setLoading(true);
@@ -53,7 +60,14 @@ export default function App() {
       if (data?.resourceType !== "Bundle") {
         throw new Error("Unexpected response (not a FHIR Bundle).");
       }
+
       setBundle(data);
+
+      // auto-select first patient for a “wow” demo feel
+      const first = (data.entry || [])
+        .map((e) => e.resource)
+        .find((r) => r?.resourceType === "Patient");
+      setSelectedPatientId(first?.id || "");
     } catch (e) {
       setError(e?.message || "Unknown error");
     } finally {
@@ -67,7 +81,7 @@ export default function App() {
   }, []);
 
   return (
-    <div style={{ maxWidth: 980, margin: "0 auto", padding: 20 }}>
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: 20 }}>
       <header style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
         <h1 style={{ margin: 0 }}>FHIR Demo (React + Vite)</h1>
         <span style={{ opacity: 0.7 }}>
@@ -76,8 +90,7 @@ export default function App() {
       </header>
 
       <p style={{ marginTop: 8, opacity: 0.8 }}>
-        This pulls <code>Patient</code> resources using a FHIR REST call and renders a
-        minimal “patient list” UI.
+        This pulls <code>Patient</code> resources using a FHIR REST call and renders a minimal “patient list” UI.
       </p>
 
       <div
@@ -162,80 +175,143 @@ export default function App() {
         </div>
       )}
 
-      <section style={{ marginTop: 18 }}>
-        <h2 style={{ marginBottom: 8 }}>Results</h2>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1.2fr 0.8fr",
+          gap: 14,
+          marginTop: 18,
+          alignItems: "start",
+        }}
+      >
+        {/* LEFT: list */}
+        <section>
+          <h2 style={{ marginBottom: 8 }}>Results</h2>
 
-        <div
+          <div style={{ display: "grid", gap: 10 }}>
+            {patients.map((p) => {
+              const name = getHumanName(p.name);
+              const gender = p.gender || "unknown";
+              const dob = p.birthDate || "—";
+              const nhsLikeId =
+                (p.identifier || []).find((id) =>
+                  (id?.system || "").toLowerCase().includes("nhs")
+                )?.value ||
+                (p.identifier || [])[0]?.value ||
+                "—";
+              const phone = getFirstTelecom(p.telecom, "phone");
+              const email = getFirstTelecom(p.telecom, "email");
+
+              const isSelected = p.id === selectedPatientId;
+
+              return (
+                <button
+                  key={p.id}
+                  onClick={() => setSelectedPatientId(p.id)}
+                  style={{
+                    textAlign: "left",
+                    width: "100%",
+                    padding: 12,
+                    borderRadius: 14,
+                    border: isSelected
+                      ? "1px solid rgba(120,180,255,0.55)"
+                      : "1px solid rgba(255,255,255,0.12)",
+                    background: isSelected
+                      ? "rgba(120,180,255,0.12)"
+                      : "rgba(255,255,255,0.04)",
+                    color: "inherit",
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 18, fontWeight: 700 }}>{name}</div>
+                      <div style={{ opacity: 0.75, marginTop: 2 }}>
+                        <code>Patient/{p.id}</code>
+                      </div>
+                    </div>
+
+                    <div style={{ textAlign: "right", opacity: 0.8 }}>
+                      <div>
+                        {gender} • {dob}
+                      </div>
+                      <div style={{ marginTop: 2 }}>
+                        <span style={{ opacity: 0.7 }}>Identifier:</span> {nhsLikeId}
+                      </div>
+                    </div>
+                  </div>
+
+                  {(phone || email) && (
+                    <div style={{ marginTop: 10, opacity: 0.85 }}>
+                      {phone && (
+                        <span style={{ marginRight: 12 }}>
+                          📞 <span style={{ opacity: 0.7 }}>Phone:</span> {phone}
+                        </span>
+                      )}
+                      {email && (
+                        <span>
+                          ✉️ <span style={{ opacity: 0.7 }}>Email:</span> {email}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+
+            {!loading && patients.length === 0 && !error && (
+              <div style={{ opacity: 0.75 }}>No patients returned.</div>
+            )}
+          </div>
+        </section>
+
+        {/* RIGHT: details */}
+        <aside
           style={{
-            display: "grid",
-            gap: 10,
+            position: "sticky",
+            top: 16,
+            padding: 14,
+            borderRadius: 16,
+            border: "1px solid rgba(255,255,255,0.12)",
+            background: "rgba(255,255,255,0.04)",
           }}
         >
-          {patients.map((p) => {
-            const name = getHumanName(p.name);
-            const gender = p.gender || "unknown";
-            const dob = p.birthDate || "—";
-            const nhsLikeId =
-              (p.identifier || []).find((id) => (id?.system || "").toLowerCase().includes("nhs"))?.value ||
-              (p.identifier || [])[0]?.value ||
-              "—";
-            const phone = getFirstTelecom(p.telecom, "phone");
-            const email = getFirstTelecom(p.telecom, "email");
+          <h2 style={{ marginTop: 0, marginBottom: 10 }}>Patient details</h2>
 
-            return (
-              <div
-                key={p.id}
-                style={{
-                  padding: 12,
-                  borderRadius: 14,
-                  border: "1px solid rgba(255,255,255,0.12)",
-                  background: "rgba(255,255,255,0.04)",
-                }}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <div>
-                    <div style={{ fontSize: 18, fontWeight: 700 }}>{name}</div>
-                    <div style={{ opacity: 0.75, marginTop: 2 }}>
-                      <code>Patient/{p.id}</code>
-                    </div>
-                  </div>
-
-                  <div style={{ textAlign: "right", opacity: 0.8 }}>
-                    <div>
-                      {gender} • {dob}
-                    </div>
-                    <div style={{ marginTop: 2 }}>
-                      <span style={{ opacity: 0.7 }}>Identifier:</span> {nhsLikeId}
-                    </div>
-                  </div>
-                </div>
-
-                {(phone || email) && (
-                  <div style={{ marginTop: 10, opacity: 0.85 }}>
-                    {phone && (
-                      <span style={{ marginRight: 12 }}>
-                        📞 <span style={{ opacity: 0.7 }}>Phone:</span> {phone}
-                      </span>
-                    )}
-                    {email && (
-                      <span>
-                        ✉️ <span style={{ opacity: 0.7 }}>Email:</span> {email}
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-
-          {!loading && patients.length === 0 && !error && (
-            <div style={{ opacity: 0.75 }}>No patients returned.</div>
+          {!selectedPatient && (
+            <div style={{ opacity: 0.8 }}>
+              Click a patient on the left to load details.
+            </div>
           )}
-        </div>
-      </section>
+
+          {selectedPatient && (
+            <div style={{ display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 18, fontWeight: 800 }}>
+                {getHumanName(selectedPatient.name)}
+              </div>
+
+              <div style={{ opacity: 0.8 }}>
+                <code>Patient/{selectedPatient.id}</code>
+              </div>
+
+              <div style={{ opacity: 0.85 }}>
+                <strong>Gender:</strong> {selectedPatient.gender || "unknown"}
+              </div>
+
+              <div style={{ opacity: 0.85 }}>
+                <strong>Date of birth:</strong> {selectedPatient.birthDate || "—"}
+              </div>
+
+              <div style={{ opacity: 0.85 }}>
+                <strong>Next:</strong> we’ll fetch <code>Observation</code> resources (vitals/labs) for this patient and show a mini timeline + an AI summary.
+              </div>
+            </div>
+          )}
+        </aside>
+      </div>
 
       <footer style={{ marginTop: 24, opacity: 0.65, fontSize: 12 }}>
-        Next: we’ll add “patient details” (Observations / vitals) + an AI summary panel.
+        After this, we’ll add Observations + a “Summarise” button for the apprenticeship AI narrative.
       </footer>
     </div>
   );
