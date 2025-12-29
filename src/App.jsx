@@ -1,445 +1,1044 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 
-/**
- * Acronyms explained (as requested):
- * - NHS = National Health Service
- * - FHIR = Fast Healthcare Interoperability Resources
- * - REST = Representational State Transfer
- * - JSON = JavaScript Object Notation
- * - UI = User Interface
- * - AI = Artificial Intelligence
- */
+const FHIR_BASE_DEFAULT = "https://hapi.fhir.org/baseR4";
 
-const FHIR_BASE = "https://hapi.fhir.org/baseR4";
-const PATIENT_SEARCH = `${FHIR_BASE}/Patient`;
-const OBS_SEARCH = `${FHIR_BASE}/Observation`;
-
-function fmtDate(iso) {
+/* ---------- tiny helpers ---------- */
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const fmtDate = (iso) => {
   if (!iso) return "—";
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toISOString().slice(0, 10);
-}
-
-function fmtDateTime(iso) {
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString(undefined, { year: "numeric", month: "short", day: "2-digit" });
+};
+const fmtDateTime = (iso) => {
   if (!iso) return "—";
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mi = String(d.getMinutes()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+};
+const safe = (v, fallback = "—") => (v === null || v === undefined || v === "" ? fallback : v);
+
+async function fetchJSON(url) {
+  const res = await fetch(url, { headers: { Accept: "application/fhir+json" } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
 }
 
-function getHumanName(patient) {
-  const name = patient?.name?.[0];
+function getPatientDisplayName(p) {
+  const name = p?.name?.[0];
   if (!name) return "Unnamed patient";
-  const given = Array.isArray(name.given) ? name.given.join(" ") : "";
+  const given = (name.given || []).join(" ");
   const family = name.family || "";
   const full = `${given} ${family}`.trim();
   return full || "Unnamed patient";
 }
-
-function getTelecom(patient) {
-  const telecom = patient?.telecom || [];
+function getPatientPhone(p) {
+  const telecom = p?.telecom || [];
   const phone = telecom.find((t) => t.system === "phone")?.value;
-  const email = telecom.find((t) => t.system === "email")?.value;
-  return { phone, email };
+  return phone || "—";
+}
+function getPatientDOB(p) {
+  return p?.birthDate || "—";
+}
+function getPatientGender(p) {
+  return p?.gender || "unknown";
+}
+function getPatientIdentifier(p) {
+  const id = p?.identifier?.[0]?.value;
+  return id || "—";
 }
 
-function safeText(s) {
-  if (s === null || s === undefined) return "—";
-  const t = String(s).trim();
-  return t.length ? t : "—";
+function getRefId(ref) {
+  // "Patient/123" -> "123"
+  if (!ref) return null;
+  const parts = String(ref).split("/");
+  return parts.length === 2 ? parts[1] : parts[0];
 }
 
-function pickObsDate(o) {
-  return o?.effectiveDateTime || o?.effectivePeriod?.start || o?.issued || null;
-}
-
+/* ---------- vital parsing (FHIR Observation) ---------- */
 /**
- * Observation parsing:
- * - Blood pressure often comes as components (systolic / diastolic)
- * - Others come as valueQuantity / valueString
+ * We target common LOINC (Logical Observation Identifiers Names and Codes) codes:
+ * - Heart rate: 8867-4
+ * - Body temperature: 8310-5
+ * - Oxygen saturation: 59408-5
+ * - Blood pressure panel: 55284-4 (components: systolic 8480-6, diastolic 8462-4)
  */
-function obsToDisplay(o) {
-  const codeText =
-    o?.code?.text ||
-    o?.code?.coding?.[0]?.display ||
-    o?.code?.coding?.[0]?.code ||
-    "Observation";
+const LOINC = {
+  HR: "8867-4",
+  TEMP: "8310-5",
+  SPO2: "59408-5",
+  BP_PANEL: "55284-4",
+  BP_SYS: "8480-6",
+  BP_DIA: "8462-4",
+};
 
-  // blood pressure (component-based)
-  if (o?.component?.length) {
-    const sys = o.component.find((c) => c?.code?.coding?.some((x) => x.code === "8480-6"));
-    const dia = o.component.find((c) => c?.code?.coding?.some((x) => x.code === "8462-4"));
-    const sysV = sys?.valueQuantity?.value;
-    const diaV = dia?.valueQuantity?.value;
-    if (sysV != null && diaV != null) {
-      return {
-        label: "Blood pressure",
-        value: `${sysV}/${diaV} mmHg`,
-        when: fmtDateTime(pickObsDate(o)),
-        kind: "bp",
-        raw: { sys: Number(sysV), dia: Number(diaV) },
-      };
-    }
-  }
-
-  // quantity-based
-  if (o?.valueQuantity?.value != null) {
-    const v = o.valueQuantity.value;
-    const u = o.valueQuantity.unit || o.valueQuantity.code || "";
-    return {
-      label: codeText,
-      value: `${v} ${u}`.trim(),
-      when: fmtDateTime(pickObsDate(o)),
-      kind: "qty",
-      raw: { value: Number(v), unit: u, codeText },
-    };
-  }
-
-  // string / codeable concept
-  if (o?.valueString) {
-    return { label: codeText, value: o.valueString, when: fmtDateTime(pickObsDate(o)), kind: "txt" };
-  }
-  const vcc = o?.valueCodeableConcept?.text || o?.valueCodeableConcept?.coding?.[0]?.display;
-  if (vcc) {
-    return { label: codeText, value: vcc, when: fmtDateTime(pickObsDate(o)), kind: "txt" };
-  }
-
-  return { label: codeText, value: "—", when: fmtDateTime(pickObsDate(o)), kind: "unknown" };
+function codeHas(obs, loinc) {
+  const coding = obs?.code?.coding || [];
+  return coding.some((c) => c.code === loinc);
 }
 
-/**
- * AI heuristics (local demo AI):
- * - Generates:
- *   1) AI Alerts (red/amber/green)
- *   2) AI Next Actions
- *   3) AI Data Quality checks
- *   4) A short "clinical narrative" summary
- */
-function buildAiInsights({ patient, obsDisplays }) {
-  const name = getHumanName(patient);
-  const gender = safeText(patient?.gender);
-  const dob = safeText(patient?.birthDate);
-
-  // pick latest values by label
-  const byLabel = new Map();
-  for (const o of obsDisplays) {
-    const key = String(o.label || "").toLowerCase();
-    if (!byLabel.has(key)) byLabel.set(key, []);
-    byLabel.get(key).push(o);
-  }
-  for (const [k, arr] of byLabel) {
-    arr.sort((a, b) => (new Date(b.when).getTime() || 0) - (new Date(a.when).getTime() || 0));
-    byLabel.set(k, arr);
-  }
-
-  const findLatest = (pred) => {
-    const flat = [...obsDisplays].slice();
-    flat.sort((a, b) => (new Date(b.when).getTime() || 0) - (new Date(a.when).getTime() || 0));
-    return flat.find(pred);
-  };
-
-  const bp = findLatest((x) => x.kind === "bp");
-  const hr = findLatest((x) => String(x.label).toLowerCase().includes("heart rate"));
-  const spo2 = findLatest((x) => String(x.label).toLowerCase().includes("oxygen"));
-  const temp = findLatest((x) => String(x.label).toLowerCase().includes("temp"));
-
-  const alerts = [];
-  const actions = [];
-  const dq = [];
-
-  // Data quality checks
-  if (!patient?.id) dq.push("Patient ID missing.");
-  if (!patient?.name?.length) dq.push("No Patient name available in resource.");
-  if (!patient?.birthDate) dq.push("Date of birth missing.");
-  if (!obsDisplays.length) dq.push("No Observation resources returned for this patient.");
-
-  // Simple thresholds (demo only)
-  if (bp?.raw?.sys != null && bp?.raw?.dia != null) {
-    const { sys, dia } = bp.raw;
-    if (sys >= 180 || dia >= 120) alerts.push({ level: "red", text: `Very high blood pressure (${sys}/${dia}).` });
-    else if (sys >= 140 || dia >= 90) alerts.push({ level: "amber", text: `Raised blood pressure (${sys}/${dia}).` });
-    else alerts.push({ level: "green", text: `Blood pressure appears within typical range (${sys}/${dia}).` });
-  } else {
-    alerts.push({ level: "amber", text: "No blood pressure available in latest Observations." });
-  }
-
-  if (hr?.raw?.value != null) {
-    const v = hr.raw.value;
-    if (v >= 130) alerts.push({ level: "red", text: `High heart rate (${v}).` });
-    else if (v >= 100) alerts.push({ level: "amber", text: `Raised heart rate (${v}).` });
-    else if (v > 0) alerts.push({ level: "green", text: `Heart rate looks stable (${v}).` });
-  } else {
-    alerts.push({ level: "amber", text: "No heart rate available in latest Observations." });
-  }
-
-  if (spo2?.raw?.value != null) {
-    const v = spo2.raw.value;
-    if (v < 90) alerts.push({ level: "red", text: `Low oxygen saturation (${v}).` });
-    else if (v < 94) alerts.push({ level: "amber", text: `Borderline oxygen saturation (${v}).` });
-    else alerts.push({ level: "green", text: `Oxygen saturation looks OK (${v}).` });
-  }
-
-  if (temp?.raw?.value != null) {
-    const v = temp.raw.value;
-    if (v >= 39) alerts.push({ level: "red", text: `High temperature (${v}).` });
-    else if (v >= 37.8) alerts.push({ level: "amber", text: `Raised temperature (${v}).` });
-    else alerts.push({ level: "green", text: `Temperature looks normal (${v}).` });
-  }
-
-  // Next Actions (demo)
-  actions.push("Review latest Observations and confirm timestamps match the current encounter.");
-  actions.push("Check for missing vitals (blood pressure, heart rate, temperature, oxygen saturation).");
-  actions.push("If trends look unusual, pull additional Observations and display a mini chart (sparkline).");
-  actions.push("Add MedicationRequest resources and Conditions to build an AI ‘patient story’ timeline.");
-
-  // Narrative summary (demo)
-  const latestFew = [...obsDisplays]
-    .slice()
-    .sort((a, b) => (new Date(b.when).getTime() || 0) - (new Date(a.when).getTime() || 0))
-    .slice(0, 5);
-
-  const summaryLines = [];
-  summaryLines.push(`Patient: ${name} • Gender: ${gender} • Date of birth: ${dob}`);
-  summaryLines.push("");
-  summaryLines.push("AI clinical narrative (demo):");
-  summaryLines.push(
-    `Latest data includes ${obsDisplays.length} Observations. Key recent items: ` +
-      (latestFew.length
-        ? latestFew.map((x) => `${x.label}: ${x.value} (${x.when})`).join(" • ")
-        : "no recent items.")
+function obsEffectiveDate(obs) {
+  return (
+    obs?.effectiveDateTime ||
+    obs?.effectiveInstant ||
+    obs?.issued ||
+    obs?.effectivePeriod?.start ||
+    null
   );
-  summaryLines.push("");
-  summaryLines.push("AI alerts:");
-  for (const a of alerts) summaryLines.push(`- [${a.level.toUpperCase()}] ${a.text}`);
-  summaryLines.push("");
-  summaryLines.push("AI next actions:");
-  for (const a of actions) summaryLines.push(`- ${a}`);
-  if (dq.length) {
-    summaryLines.push("");
-    summaryLines.push("AI data-quality checks:");
-    for (const d of dq) summaryLines.push(`- ${d}`);
-  }
-
-  return { alerts, actions, dq, narrative: summaryLines.join("\n") };
 }
 
-/**
- * OPTIONAL real AI hook:
- * - If you later build a tiny backend endpoint, you can send patient+observations to it.
- * - This keeps the demo “AI-heavy” but also board-safe and controllable.
- *
- * Set in .env.local:
- *   VITE_AI_ENDPOINT=https://your-backend.example/ai/summary
- */
-async function callRealAiEndpoint({ patient, observations }) {
-  const endpoint = import.meta.env.VITE_AI_ENDPOINT;
-  if (!endpoint) return null;
+function numericValueFromObs(obs) {
+  const q = obs?.valueQuantity;
+  if (q && typeof q.value === "number") return q.value;
+  if (q && typeof q.value === "string" && q.value.trim() !== "") return Number(q.value);
+  return null;
+}
 
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ patient, observations }),
+function extractBP(obs) {
+  // Either panel with components or direct systolic/diastolic observations.
+  if (codeHas(obs, LOINC.BP_PANEL) && Array.isArray(obs.component)) {
+    let sys = null;
+    let dia = null;
+    for (const c of obs.component) {
+      const coding = c?.code?.coding || [];
+      const isSys = coding.some((x) => x.code === LOINC.BP_SYS);
+      const isDia = coding.some((x) => x.code === LOINC.BP_DIA);
+      if (isSys) sys = c?.valueQuantity?.value ?? sys;
+      if (isDia) dia = c?.valueQuantity?.value ?? dia;
+    }
+    return { sys: typeof sys === "number" ? sys : null, dia: typeof dia === "number" ? dia : null };
+  }
+  if (codeHas(obs, LOINC.BP_SYS)) return { sys: numericValueFromObs(obs), dia: null };
+  if (codeHas(obs, LOINC.BP_DIA)) return { sys: null, dia: numericValueFromObs(obs) };
+  return { sys: null, dia: null };
+}
+
+function pickUnit(obs) {
+  return obs?.valueQuantity?.unit || obs?.valueQuantity?.code || "";
+}
+
+function firstCodingDisplay(codeable) {
+  const c = codeable?.coding?.[0];
+  return c?.display || codeable?.text || "—";
+}
+
+/* ---------- mini sparkline (SVG) ---------- */
+function Sparkline({ values = [], height = 28, width = 92 }) {
+  const clean = values.filter((v) => typeof v === "number" && Number.isFinite(v));
+  if (clean.length < 2) return <div className="sparkEmpty">—</div>;
+
+  const min = Math.min(...clean);
+  const max = Math.max(...clean);
+  const span = max - min || 1;
+
+  const pts = clean.map((v, i) => {
+    const x = (i / (clean.length - 1)) * (width - 4) + 2;
+    const y = height - ((v - min) / span) * (height - 6) - 3;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
   });
 
-  if (!res.ok) throw new Error(`AI endpoint error: ${res.status}`);
-  const data = await res.json();
-  // expected: { summaryText: "..." }
-  return data?.summaryText || null;
-}
-
-function VitalCard({ label, value, when }) {
   return (
-    <div className="obsCard">
-      <div className="obsLabel">{label}</div>
-      <div className="obsValue">{value}</div>
-      <div className="obsWhen">{when}</div>
-    </div>
+    <svg className="spark" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+      <polyline points={pts.join(" ")} fill="none" stroke="currentColor" strokeWidth="2" />
+    </svg>
   );
 }
 
-function levelDotClass(level) {
-  if (level === "green") return "dot dotGreen";
-  if (level === "amber") return "dot dotAmber";
-  if (level === "red") return "dot dotRed";
-  return "dot";
+/* ---------- triage + completeness ---------- */
+function computeTriage(latest, rules) {
+  // latest: { bpSys, bpDia, hr, temp, spo2 } (numbers or null)
+  // rules: thresholds
+  const reasons = [];
+  let level = "GREEN";
+
+  const bump = (to) => {
+    const order = { GREEN: 0, AMBER: 1, RED: 2 };
+    if (order[to] > order[level]) level = to;
+  };
+
+  if (typeof latest?.bpSys === "number") {
+    if (latest.bpSys >= rules.bpRedSys) {
+      bump("RED");
+      reasons.push(`Systolic blood pressure ≥ ${rules.bpRedSys} mmHg.`);
+    } else if (latest.bpSys >= rules.bpAmberSys) {
+      bump("AMBER");
+      reasons.push(`Systolic blood pressure ≥ ${rules.bpAmberSys} mmHg.`);
+    }
+  }
+  if (typeof latest?.bpDia === "number") {
+    if (latest.bpDia >= rules.bpRedDia) {
+      bump("RED");
+      reasons.push(`Diastolic blood pressure ≥ ${rules.bpRedDia} mmHg.`);
+    } else if (latest.bpDia >= rules.bpAmberDia) {
+      bump("AMBER");
+      reasons.push(`Diastolic blood pressure ≥ ${rules.bpAmberDia} mmHg.`);
+    }
+  }
+
+  if (typeof latest?.hr === "number") {
+    if (latest.hr >= rules.hrRed) {
+      bump("RED");
+      reasons.push(`Heart rate ≥ ${rules.hrRed} bpm (beats per minute).`);
+    } else if (latest.hr >= rules.hrAmber) {
+      bump("AMBER");
+      reasons.push(`Heart rate ≥ ${rules.hrAmber} bpm (beats per minute).`);
+    }
+  }
+
+  if (typeof latest?.temp === "number") {
+    if (latest.temp >= rules.tempRed) {
+      bump("RED");
+      reasons.push(`Temperature ≥ ${rules.tempRed} °C.`);
+    } else if (latest.temp >= rules.tempAmber) {
+      bump("AMBER");
+      reasons.push(`Temperature ≥ ${rules.tempAmber} °C.`);
+    }
+  }
+
+  if (typeof latest?.spo2 === "number") {
+    if (latest.spo2 <= rules.spo2Red) {
+      bump("RED");
+      reasons.push(`Oxygen saturation ≤ ${rules.spo2Red}%.`);
+    } else if (latest.spo2 <= rules.spo2Amber) {
+      bump("AMBER");
+      reasons.push(`Oxygen saturation ≤ ${rules.spo2Amber}%.`);
+    }
+  }
+
+  if (reasons.length === 0) reasons.push("No RED/AMBER triggers found in latest vitals window (demo rule).");
+  return { level, reasons };
 }
 
+function computeCompleteness(latest, wanted = ["bpSys", "hr", "temp", "spo2"]) {
+  const missing = [];
+  for (const k of wanted) {
+    if (!(typeof latest?.[k] === "number" && Number.isFinite(latest[k]))) missing.push(k);
+  }
+  return missing;
+}
+
+function missingLabel(k) {
+  if (k === "bpSys") return "Blood pressure";
+  if (k === "hr") return "Heart rate";
+  if (k === "temp") return "Temperature";
+  if (k === "spo2") return "Oxygen saturation";
+  return k;
+}
+
+/* ---------- concurrency limiter ---------- */
+async function mapLimit(items, limit, mapper) {
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = new Array(limit).fill(0).map(async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) break;
+      out[idx] = await mapper(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/* ---------- PDF export (NO popups) ---------- */
+async function exportAiNoteToPdf(noteEl, filename = "AI_note.pdf") {
+  if (!noteEl) return;
+
+  const canvas = await html2canvas(noteEl, {
+    scale: 2,
+    backgroundColor: "#ffffff",
+    useCORS: true,
+    logging: false,
+  });
+
+  const imgData = canvas.toDataURL("image/png");
+  const pdf = new jsPDF("p", "mm", "a4");
+
+  const pageW = pdf.internal.pageSize.getWidth();
+  const pageH = pdf.internal.pageSize.getHeight();
+
+  // Fit image to page width; keep aspect ratio.
+  const imgProps = pdf.getImageProperties(imgData);
+  const imgW = pageW;
+  const imgH = (imgProps.height * imgW) / imgProps.width;
+
+  let y = 0;
+  if (imgH <= pageH) {
+    pdf.addImage(imgData, "PNG", 0, 0, imgW, imgH);
+  } else {
+    // Multi-page slicing
+    let remaining = imgH;
+    let offset = 0;
+    while (remaining > 0) {
+      pdf.addImage(imgData, "PNG", 0, -offset, imgW, imgH);
+      remaining -= pageH;
+      offset += pageH;
+      if (remaining > 0) pdf.addPage();
+    }
+  }
+
+  pdf.save(filename);
+}
+
+/* ---------- App ---------- */
 export default function App() {
-  const [nameContains, setNameContains] = useState("smith");
+  const [fhirBase, setFhirBase] = useState(FHIR_BASE_DEFAULT);
+  const [nameQuery, setNameQuery] = useState("smith");
   const [count, setCount] = useState(10);
 
-  const [loadingPatients, setLoadingPatients] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [patients, setPatients] = useState([]);
-  const [patientsErr, setPatientsErr] = useState("");
+  const [selectedPatientId, setSelectedPatientId] = useState(null);
+  const [error, setError] = useState("");
 
-  const [selectedPatient, setSelectedPatient] = useState(null);
+  // views
+  const [view, setView] = useState("worklist"); // "worklist" | "patient" | "governance"
+  const [worklistFilter, setWorklistFilter] = useState("ALL"); // ALL | RED | AMBER | GREEN | MISSING
+  const [sortMode, setSortMode] = useState("RISK"); // RISK | NAME | RECENT
 
-  const [loadingObs, setLoadingObs] = useState(false);
-  const [obs, setObs] = useState([]);
-  const [obsErr, setObsErr] = useState("");
+  // governance + audit
+  const [modelVersion] = useState("demo-rules-v1.3");
+  const [modelReviewed] = useState("2025-12-29");
+  const [audit, setAudit] = useState([]);
 
-  const [aiSummary, setAiSummary] = useState("");
+  // rule thresholds (configurable)
+  const [rules, setRules] = useState({
+    bpRedSys: 180,
+    bpRedDia: 120,
+    bpAmberSys: 140,
+    bpAmberDia: 90,
+    hrRed: 130,
+    hrAmber: 100,
+    spo2Red: 90,
+    spo2Amber: 94,
+    tempRed: 39,
+    tempAmber: 37.8,
+    completenessHours: 24,
+  });
+
+  // caches
+  const [obsByPatient, setObsByPatient] = useState({}); // patientId -> parsed vitals data
+  const [encByPatient, setEncByPatient] = useState({});
+  const [condByPatient, setCondByPatient] = useState({});
+  const [medByPatient, setMedByPatient] = useState({});
+  const [snapshotByPatient, setSnapshotByPatient] = useState({}); // worklist preview
+  const [aiNote, setAiNote] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
-  const [useRealAi, setUseRealAi] = useState(false);
+  const [expandedWhy, setExpandedWhy] = useState({}); // story item id -> bool
 
+  const aiNoteRef = useRef(null);
+
+  function addAudit(action, details = "") {
+    const ts = new Date().toISOString();
+    setAudit((prev) => [
+      { ts, actor: "demo.clinician", action, details },
+      ...prev.slice(0, 24),
+    ]);
+  }
+
+  /* ---------- search patients ---------- */
   async function searchPatients() {
-    setLoadingPatients(true);
-    setPatientsErr("");
-    setPatients([]);
-
+    setLoading(true);
+    setError("");
     try {
-      const url =
-        `${PATIENT_SEARCH}?` +
-        new URLSearchParams({
-          name: nameContains || "",
-          _count: String(count || 10),
-        }).toString();
-
-      const res = await fetch(url, { headers: { Accept: "application/fhir+json" } });
-      if (!res.ok) throw new Error(`FHIR patient search failed: ${res.status}`);
-
-      const bundle = await res.json();
-      const entries = bundle?.entry || [];
-      const pts = entries.map((e) => e.resource).filter(Boolean);
-      setPatients(pts);
-
-      if (pts.length) setSelectedPatient(pts[0]);
-      else setSelectedPatient(null);
+      // Patient?name=smith&_count=10
+      const url = `${fhirBase}/Patient?name=${encodeURIComponent(nameQuery)}&_count=${encodeURIComponent(
+        count
+      )}`;
+      const data = await fetchJSON(url);
+      const entries = data?.entry || [];
+      const list = entries
+        .map((e) => e.resource)
+        .filter((r) => r && r.resourceType === "Patient");
+      setPatients(list);
+      const firstId = list?.[0]?.id || null;
+      setSelectedPatientId((prev) => prev || firstId);
+      addAudit("Patient search", `name contains "${nameQuery}", count ${count}`);
     } catch (e) {
-      setPatientsErr(e?.message || "Unknown error searching patients.");
-      setSelectedPatient(null);
+      setError(`Search failed: ${e.message}`);
     } finally {
-      setLoadingPatients(false);
+      setLoading(false);
     }
   }
 
-  async function fetchObservationsForPatient(patientId) {
-    if (!patientId) return;
-    setLoadingObs(true);
-    setObsErr("");
-    setObs([]);
-    setAiSummary("");
-
-    try {
-      const url =
-        `${OBS_SEARCH}?` +
-        new URLSearchParams({
-          subject: `Patient/${patientId}`,
-          _sort: "-date",
-          _count: "25",
-        }).toString();
-
-      const res = await fetch(url, { headers: { Accept: "application/fhir+json" } });
-      if (!res.ok) throw new Error(`FHIR Observation search failed: ${res.status}`);
-
-      const bundle = await res.json();
-      const entries = bundle?.entry || [];
-      const items = entries.map((e) => e.resource).filter(Boolean);
-      setObs(items);
-    } catch (e) {
-      setObsErr(e?.message || "Unknown error fetching Observations.");
-    } finally {
-      setLoadingObs(false);
-    }
-  }
-
-  // initial load
   useEffect(() => {
     searchPatients();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // load observations when selection changes
-  useEffect(() => {
-    if (selectedPatient?.id) fetchObservationsForPatient(selectedPatient.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPatient?.id]);
+  /* ---------- FHIR fetches ---------- */
+  async function fetchVitals(patientId) {
+    // vital signs only; enough for triage + completeness + sparklines
+    const url = `${fhirBase}/Observation?patient=${encodeURIComponent(
+      patientId
+    )}&category=vital-signs&_sort=-date&_count=200`;
+    const data = await fetchJSON(url);
+    const obs = (data?.entry || []).map((e) => e.resource).filter(Boolean);
 
-  const patientTelecom = useMemo(() => getTelecom(selectedPatient), [selectedPatient]);
+    // Build series (most recent first -> reverse for sparkline)
+    const series = { bpSys: [], bpDia: [], hr: [], temp: [], spo2: [] };
+    const when = { bpSys: null, bpDia: null, hr: null, temp: null, spo2: null };
+    const units = { hr: "", temp: "", spo2: "", bp: "mmHg" };
 
-  const obsDisplays = useMemo(() => obs.map(obsToDisplay), [obs]);
-
-  // curated “vitals-like” cards for the top area
-  const vitalsCards = useMemo(() => {
-    const latestByKey = new Map();
-
-    const wantKeys = [
-      { key: "Blood pressure", pred: (x) => x.kind === "bp" },
-      { key: "Heart rate", pred: (x) => String(x.label).toLowerCase().includes("heart rate") },
-      { key: "Temperature", pred: (x) => String(x.label).toLowerCase().includes("temp") },
-      { key: "Oxygen saturation", pred: (x) => String(x.label).toLowerCase().includes("oxygen") },
-    ];
-
-    const sorted = [...obsDisplays].slice().sort((a, b) => {
-      const ta = new Date(a.when).getTime() || 0;
-      const tb = new Date(b.when).getTime() || 0;
-      return tb - ta;
-    });
-
-    for (const item of sorted) {
-      for (const w of wantKeys) {
-        if (latestByKey.has(w.key)) continue;
-        if (w.pred(item)) latestByKey.set(w.key, item);
-      }
-      if (latestByKey.size === wantKeys.length) break;
-    }
-
-    return wantKeys.map((w) => {
-      const it = latestByKey.get(w.key);
-      return {
-        label: w.key,
-        value: it?.value || "—",
-        when: it?.when || "—",
-      };
-    });
-  }, [obsDisplays]);
-
-  const timelineItems = useMemo(() => {
-    const sorted = [...obsDisplays].slice().sort((a, b) => {
-      const ta = new Date(a.when).getTime() || 0;
-      const tb = new Date(b.when).getTime() || 0;
-      return tb - ta;
-    });
-    return sorted.slice(0, 10);
-  }, [obsDisplays]);
-
-  const aiInsights = useMemo(() => {
-    if (!selectedPatient) return null;
-    return buildAiInsights({ patient: selectedPatient, obsDisplays });
-  }, [selectedPatient, obsDisplays]);
-
-  async function generateAiSummary() {
-    if (!selectedPatient) return;
-
-    setAiBusy(true);
-    setAiSummary("");
-
-    try {
-      // 1) If “Real AI” toggle enabled AND endpoint exists, call it
-      if (useRealAi) {
-        const txt = await callRealAiEndpoint({ patient: selectedPatient, observations: obs });
-        if (txt) {
-          setAiSummary(txt);
-          return;
+    for (const o of obs) {
+      const dt = obsEffectiveDate(o);
+      // BP panel
+      if (codeHas(o, LOINC.BP_PANEL) || codeHas(o, LOINC.BP_SYS) || codeHas(o, LOINC.BP_DIA)) {
+        const bp = extractBP(o);
+        if (typeof bp.sys === "number") {
+          series.bpSys.push(bp.sys);
+          if (!when.bpSys) when.bpSys = dt;
+        }
+        if (typeof bp.dia === "number") {
+          series.bpDia.push(bp.dia);
+          if (!when.bpDia) when.bpDia = dt;
         }
       }
 
-      // 2) Otherwise use local AI heuristics (still “AI” in the demo sense)
-      const local = buildAiInsights({ patient: selectedPatient, obsDisplays });
-      setAiSummary(local.narrative);
-    } catch (e) {
-      setAiSummary(`AI summary failed: ${e?.message || "Unknown error"}`);
+      if (codeHas(o, LOINC.HR)) {
+        const v = numericValueFromObs(o);
+        if (typeof v === "number") {
+          series.hr.push(v);
+          if (!when.hr) when.hr = dt;
+          if (!units.hr) units.hr = pickUnit(o);
+        }
+      }
+      if (codeHas(o, LOINC.TEMP)) {
+        const v = numericValueFromObs(o);
+        if (typeof v === "number") {
+          series.temp.push(v);
+          if (!when.temp) when.temp = dt;
+          if (!units.temp) units.temp = pickUnit(o);
+        }
+      }
+      if (codeHas(o, LOINC.SPO2)) {
+        const v = numericValueFromObs(o);
+        if (typeof v === "number") {
+          series.spo2.push(v);
+          if (!when.spo2) when.spo2 = dt;
+          if (!units.spo2) units.spo2 = pickUnit(o);
+        }
+      }
+    }
+
+    // latest values (first pushed are newest because sorted -date)
+    const latest = {
+      bpSys: series.bpSys[0] ?? null,
+      bpDia: series.bpDia[0] ?? null,
+      hr: series.hr[0] ?? null,
+      temp: series.temp[0] ?? null,
+      spo2: series.spo2[0] ?? null,
+    };
+
+    // Reverse series for sparkline (oldest -> newest), keep last 12 points.
+    const spark = {
+      bpSys: series.bpSys.slice(0, 24).reverse().slice(-12),
+      hr: series.hr.slice(0, 24).reverse().slice(-12),
+      temp: series.temp.slice(0, 24).reverse().slice(-12),
+      spo2: series.spo2.slice(0, 24).reverse().slice(-12),
+    };
+
+    return { latest, when, units, spark, rawCount: obs.length };
+  }
+
+  async function fetchEncounters(patientId) {
+    const url = `${fhirBase}/Encounter?patient=${encodeURIComponent(patientId)}&_sort=-date&_count=30`;
+    const data = await fetchJSON(url);
+    const enc = (data?.entry || []).map((e) => e.resource).filter(Boolean);
+    return enc;
+  }
+
+  async function fetchConditions(patientId) {
+    const url = `${fhirBase}/Condition?patient=${encodeURIComponent(patientId)}&_sort=-recorded-date&_count=30`;
+    const data = await fetchJSON(url);
+    const cond = (data?.entry || []).map((e) => e.resource).filter(Boolean);
+    return cond;
+  }
+
+  async function fetchMedicationRequests(patientId) {
+    const url = `${fhirBase}/MedicationRequest?patient=${encodeURIComponent(patientId)}&_sort=-authoredon&_count=30`;
+    const data = await fetchJSON(url);
+    const meds = (data?.entry || []).map((e) => e.resource).filter(Boolean);
+    return meds;
+  }
+
+  /* ---------- load selected patient full story ---------- */
+  useEffect(() => {
+    if (!selectedPatientId) return;
+
+    (async () => {
+      try {
+        const pid = selectedPatientId;
+
+        // Load in parallel
+        const [v, enc, cond, meds] = await Promise.all([
+          fetchVitals(pid),
+          fetchEncounters(pid),
+          fetchConditions(pid),
+          fetchMedicationRequests(pid),
+        ]);
+
+        setObsByPatient((prev) => ({ ...prev, [pid]: v }));
+        setEncByPatient((prev) => ({ ...prev, [pid]: enc }));
+        setCondByPatient((prev) => ({ ...prev, [pid]: cond }));
+        setMedByPatient((prev) => ({ ...prev, [pid]: meds }));
+
+        addAudit("Loaded patient story data", `Patient/${pid} vitals+encounters+conditions+medications`);
+      } catch (e) {
+        // keep UI alive
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPatientId, fhirBase]);
+
+  /* ---------- Worklist snapshots (make the list look intelligent) ---------- */
+  useEffect(() => {
+    if (!patients?.length) return;
+
+    let cancelled = false;
+
+    (async () => {
+      // Build snapshots for visible list (limited concurrency)
+      const list = patients.map((p) => p.id).filter(Boolean);
+
+      await mapLimit(
+        list,
+        3,
+        async (pid) => {
+          if (cancelled) return;
+
+          // Don’t refetch if we already have a snapshot
+          if (snapshotByPatient[pid]) return;
+
+          try {
+            const [v, enc, cond, meds] = await Promise.all([
+              fetchVitals(pid),
+              fetchEncounters(pid),
+              fetchConditions(pid),
+              fetchMedicationRequests(pid),
+            ]);
+
+            const triage = computeTriage(v.latest, rules);
+            const missing = computeCompleteness(v.latest);
+            const lastEnc = enc?.[0]?.period?.start || enc?.[0]?.period?.end || enc?.[0]?.meta?.lastUpdated || null;
+
+            const snap = {
+              triage: triage.level,
+              triageReasons: triage.reasons,
+              missing,
+              lastEncounter: lastEnc,
+              counts: { conditions: (cond || []).length, meds: (meds || []).length, encounters: (enc || []).length },
+              vitalsLatest: v.latest,
+              vitalsWhen: v.when,
+              spark: v.spark,
+            };
+
+            setSnapshotByPatient((prev) => ({ ...prev, [pid]: snap }));
+          } catch (e) {
+            setSnapshotByPatient((prev) => ({
+              ...prev,
+              [pid]: { triage: "UNKNOWN", triageReasons: ["Unable to fetch preview."], missing: ["bpSys", "hr", "temp", "spo2"] },
+            }));
+          }
+        }
+      );
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [patients, fhirBase]);
+
+  /* ---------- derived: selected patient objects ---------- */
+  const selectedPatient = useMemo(() => patients.find((p) => p.id === selectedPatientId) || null, [
+    patients,
+    selectedPatientId,
+  ]);
+
+  const selectedVitals = obsByPatient[selectedPatientId] || null;
+  const selectedEnc = encByPatient[selectedPatientId] || [];
+  const selectedCond = condByPatient[selectedPatientId] || [];
+  const selectedMeds = medByPatient[selectedPatientId] || [];
+
+  const selectedTriage = useMemo(() => {
+    if (!selectedVitals) return { level: "UNKNOWN", reasons: ["Loading vitals…"] };
+    return computeTriage(selectedVitals.latest, rules);
+  }, [selectedVitals, rules]);
+
+  const selectedMissing = useMemo(() => {
+    if (!selectedVitals) return ["bpSys", "hr", "temp", "spo2"];
+    return computeCompleteness(selectedVitals.latest);
+  }, [selectedVitals]);
+
+  /* ---------- story timeline (Encounter + Condition + MedicationRequest + key Observations summary) ---------- */
+  const storyItems = useMemo(() => {
+    const items = [];
+
+    // Encounters
+    for (const e of selectedEnc || []) {
+      const when = e?.period?.start || e?.period?.end || e?.meta?.lastUpdated;
+      items.push({
+        id: `enc-${e.id}`,
+        kind: "Encounter",
+        title: firstCodingDisplay(e?.type?.[0]) || "Encounter",
+        when,
+        triage: "GREEN",
+        why: ["Episode of care anchor used to group events (demo)."],
+      });
+    }
+
+    // Conditions
+    for (const c of selectedCond || []) {
+      const when = c?.recordedDate || c?.onsetDateTime || c?.meta?.lastUpdated;
+      const title = firstCodingDisplay(c?.code) || "Condition";
+      items.push({
+        id: `cond-${c.id}`,
+        kind: "Condition",
+        title,
+        when,
+        triage: "AMBER",
+        why: ["Active conditions contribute to clinical context (demo)."],
+      });
+    }
+
+    // MedicationRequest
+    for (const m of selectedMeds || []) {
+      const when = m?.authoredOn || m?.meta?.lastUpdated;
+      const title = firstCodingDisplay(m?.medicationCodeableConcept) || "Medication request";
+      items.push({
+        id: `med-${m.id}`,
+        kind: "MedicationRequest",
+        title,
+        when,
+        triage: "GREEN",
+        why: ["Current medication requests add to the longitudinal story (demo)."],
+      });
+    }
+
+    // Vital summary entry
+    if (selectedVitals?.latest) {
+      const when =
+        selectedVitals.when.bpSys ||
+        selectedVitals.when.hr ||
+        selectedVitals.when.temp ||
+        selectedVitals.when.spo2 ||
+        null;
+
+      const tri = computeTriage(selectedVitals.latest, rules);
+      const parts = [];
+      if (typeof selectedVitals.latest.bpSys === "number" && typeof selectedVitals.latest.bpDia === "number")
+        parts.push(`BP ${selectedVitals.latest.bpSys}/${selectedVitals.latest.bpDia} mmHg`);
+      if (typeof selectedVitals.latest.hr === "number") parts.push(`HR ${selectedVitals.latest.hr} bpm`);
+      if (typeof selectedVitals.latest.temp === "number") parts.push(`Temp ${selectedVitals.latest.temp} °C`);
+      if (typeof selectedVitals.latest.spo2 === "number") parts.push(`SpO₂ ${selectedVitals.latest.spo2}%`);
+
+      items.push({
+        id: `vitals-latest`,
+        kind: "Observation",
+        title: parts.length ? parts.join(" · ") : "Latest vitals",
+        when,
+        triage: tri.level,
+        why: tri.reasons,
+      });
+    }
+
+    // Sort newest first
+    items.sort((a, b) => (new Date(b.when || 0)).getTime() - (new Date(a.when || 0)).getTime());
+    return items.slice(0, 14);
+  }, [selectedEnc, selectedCond, selectedMeds, selectedVitals, rules]);
+
+  /* ---------- Worklist KPIs ---------- */
+  const worklistStats = useMemo(() => {
+    const snaps = patients
+      .map((p) => snapshotByPatient[p.id])
+      .filter(Boolean);
+
+    const counts = { RED: 0, AMBER: 0, GREEN: 0, UNKNOWN: 0, MISSING: 0 };
+    for (const s of snaps) {
+      const t = s?.triage || "UNKNOWN";
+      counts[t] = (counts[t] || 0) + 1;
+      if (Array.isArray(s?.missing) && s.missing.length) counts.MISSING += 1;
+    }
+    return counts;
+  }, [patients, snapshotByPatient]);
+
+  const filteredWorklist = useMemo(() => {
+    const list = patients.map((p) => {
+      const snap = snapshotByPatient[p.id] || null;
+      return { p, snap };
+    });
+
+    const filtered = list.filter(({ snap }) => {
+      if (worklistFilter === "ALL") return true;
+      if (worklistFilter === "MISSING") return (snap?.missing || []).length > 0;
+      return (snap?.triage || "UNKNOWN") === worklistFilter;
+    });
+
+    const score = (snap) => {
+      const order = { RED: 3, AMBER: 2, GREEN: 1, UNKNOWN: 0 };
+      const base = order[snap?.triage || "UNKNOWN"] || 0;
+      const miss = (snap?.missing || []).length ? 0.2 : 0;
+      return base + miss;
+    };
+
+    filtered.sort((a, b) => {
+      if (sortMode === "NAME") return getPatientDisplayName(a.p).localeCompare(getPatientDisplayName(b.p));
+      if (sortMode === "RECENT") {
+        const ad = new Date(a.snap?.lastEncounter || 0).getTime();
+        const bd = new Date(b.snap?.lastEncounter || 0).getTime();
+        return bd - ad;
+      }
+      // default RISK
+      return score(b.snap) - score(a.snap);
+    });
+
+    return filtered;
+  }, [patients, snapshotByPatient, worklistFilter, sortMode]);
+
+  /* ---------- AI summary note (demo “AI heavy”) ---------- */
+  async function generateAiSummary() {
+    if (!selectedPatientId) return;
+    setAiBusy(true);
+    try {
+      // This is a demo “AI note” generator (rule-driven).
+      // In the next upgrade we swap this for an actual model + governance service.
+      const name = getPatientDisplayName(selectedPatient);
+      const pid = selectedPatientId;
+
+      const tri = selectedTriage;
+      const miss = selectedMissing;
+
+      const lastEnc = selectedEnc?.[0]?.period?.start || selectedEnc?.[0]?.meta?.lastUpdated || null;
+
+      const noteLines = [];
+      noteLines.push(`AI clinical assistant note (demo)`);
+      noteLines.push(`Patient: ${name} (Patient/${pid})`);
+      noteLines.push(`Generated: ${fmtDateTime(new Date().toISOString())}`);
+      noteLines.push("");
+      noteLines.push(`Triage: ${tri.level}`);
+      for (const r of tri.reasons) noteLines.push(`- ${r}`);
+      noteLines.push("");
+
+      noteLines.push(`Episode-of-care (Encounter) check (demo):`);
+      noteLines.push(`- Most recent encounter: ${fmtDateTime(lastEnc)}`);
+      noteLines.push(`- Validation: timestamps are within the same care window: DEMO CHECK (upgrade to real episode logic).`);
+      noteLines.push("");
+
+      noteLines.push(`Data completeness check (last ${rules.completenessHours} hours):`);
+      if (miss.length === 0) {
+        noteLines.push(`- Complete: all key vitals present.`);
+      } else {
+        noteLines.push(`- Missing: ${miss.map(missingLabel).join(", ")}.`);
+        noteLines.push(`- Action: trigger “data completeness” flag for clinical review.`);
+      }
+      noteLines.push("");
+
+      noteLines.push(`Top active problems (Conditions) (demo):`);
+      if (!selectedCond?.length) noteLines.push(`- None returned by server.`);
+      else selectedCond.slice(0, 5).forEach((c) => noteLines.push(`- ${firstCodingDisplay(c?.code)}`));
+      noteLines.push("");
+
+      noteLines.push(`Current medications (MedicationRequest) (demo):`);
+      if (!selectedMeds?.length) noteLines.push(`- None returned by server.`);
+      else selectedMeds.slice(0, 5).forEach((m) => noteLines.push(`- ${firstCodingDisplay(m?.medicationCodeableConcept)}`));
+      noteLines.push("");
+
+      noteLines.push(`AI next actions (demo):`);
+      noteLines.push(`- Validate timestamps align to an episode of care (Encounter).`);
+      noteLines.push(`- Check missing vitals and raise a data completeness flag.`);
+      noteLines.push(`- Surface Conditions + MedicationRequests in one timeline view.`);
+      noteLines.push(`- Provide rule-based triage suggestions and export this note to PDF (Portable Document Format).`);
+
+      setAiNote(noteLines.join("\n"));
+      addAudit("Generated AI note", `Patient/${pid} triage ${tri.level}`);
     } finally {
       setAiBusy(false);
     }
   }
 
+  /* ---------- UI components ---------- */
+  function TriagePill({ level }) {
+    const cls =
+      level === "RED" ? "pillRed" : level === "AMBER" ? "pillAmber" : level === "GREEN" ? "pillGreen" : "pillUnknown";
+    return <span className={`triagePill ${cls}`}>{level}</span>;
+  }
+
+  function WorklistRow({ p, snap }) {
+    const active = p.id === selectedPatientId;
+    const name = getPatientDisplayName(p);
+    const phone = getPatientPhone(p);
+    const gender = getPatientGender(p);
+    const dob = getPatientDOB(p);
+
+    const tri = snap?.triage || "UNKNOWN";
+    const missing = snap?.missing || [];
+    const lastEnc = snap?.lastEncounter || null;
+
+    return (
+      <div
+        className={`wRow ${active ? "wRowActive" : ""}`}
+        onClick={() => {
+          setSelectedPatientId(p.id);
+          setView("worklist");
+          addAudit("Selected patient from worklist", `Patient/${p.id}`);
+        }}
+        role="button"
+        tabIndex={0}
+      >
+        <div className="wLeft">
+          <div className="wTitle">
+            <div className="wName">{name}</div>
+            <div className="wBadges">
+              <TriagePill level={tri} />
+              {missing.length > 0 ? <span className="flagMissing">Missing data</span> : <span className="flagOk">Complete</span>}
+            </div>
+          </div>
+
+          <div className="wSub">
+            <span className="wMeta">Patient/{p.id}</span>
+            <span className="wDot">•</span>
+            <span className="wMeta">{gender}</span>
+            <span className="wDot">•</span>
+            <span className="wMeta">{dob}</span>
+          </div>
+
+          <div className="wMiniGrid">
+            <div className="miniCell">
+              <div className="miniLabel">Blood pressure</div>
+              <div className="miniVal">
+                {typeof snap?.vitalsLatest?.bpSys === "number" ? `${snap.vitalsLatest.bpSys}/${safe(snap.vitalsLatest.bpDia, "—")}` : "—"}
+                <span className="miniUnit"> mmHg</span>
+              </div>
+              <div className="miniSpark">
+                <Sparkline values={snap?.spark?.bpSys || []} />
+              </div>
+            </div>
+
+            <div className="miniCell">
+              <div className="miniLabel">Heart rate</div>
+              <div className="miniVal">
+                {typeof snap?.vitalsLatest?.hr === "number" ? snap.vitalsLatest.hr : "—"}
+                <span className="miniUnit"> bpm</span>
+              </div>
+              <div className="miniSpark">
+                <Sparkline values={snap?.spark?.hr || []} />
+              </div>
+            </div>
+
+            <div className="miniCell">
+              <div className="miniLabel">Temperature</div>
+              <div className="miniVal">
+                {typeof snap?.vitalsLatest?.temp === "number" ? snap.vitalsLatest.temp : "—"}
+                <span className="miniUnit"> °C</span>
+              </div>
+              <div className="miniSpark">
+                <Sparkline values={snap?.spark?.temp || []} />
+              </div>
+            </div>
+
+            <div className="miniCell">
+              <div className="miniLabel">Oxygen saturation</div>
+              <div className="miniVal">
+                {typeof snap?.vitalsLatest?.spo2 === "number" ? snap.vitalsLatest.spo2 : "—"}
+                <span className="miniUnit"> %</span>
+              </div>
+              <div className="miniSpark">
+                <Sparkline values={snap?.spark?.spo2 || []} />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="wRight">
+          <div className="wRightLine">
+            <span className="wRightKey">Phone</span>
+            <span className="wRightVal">{phone}</span>
+          </div>
+          <div className="wRightLine">
+            <span className="wRightKey">Last encounter</span>
+            <span className="wRightVal">{fmtDateTime(lastEnc)}</span>
+          </div>
+          <div className="wRightLine">
+            <span className="wRightKey">Conditions</span>
+            <span className="wRightVal">{safe(snap?.counts?.conditions, "—")}</span>
+          </div>
+          <div className="wRightLine">
+            <span className="wRightKey">Medication</span>
+            <span className="wRightVal">{safe(snap?.counts?.meds, "—")}</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function PatientDetailsPanel({ compact = false }) {
+    const p = selectedPatient;
+    if (!p) return (
+      <div className="card cardPad">
+        <div className="bigAiTitle">AI clinical assistant (demo)</div>
+        <div className="subtle">Select a patient to view the clinical story.</div>
+      </div>
+    );
+
+    const name = getPatientDisplayName(p);
+    const pid = p.id;
+    const tri = selectedTriage;
+    const miss = selectedMissing;
+
+    return (
+      <div className="card cardPad">
+        <div className="detailsHeader">
+          <div className="sectionTitle">Patient details</div>
+          <div className="detailsName">{name}</div>
+          <div className="subtle">Patient/{pid}</div>
+        </div>
+
+        <div className="kvRow">
+          <div className="kv"><span>Gender</span>{getPatientGender(p)}</div>
+          <div className="kv"><span>Date of birth</span>{getPatientDOB(p)}</div>
+        </div>
+
+        <div className="aiCockpit">
+          <div className="bigAiTitle">AI clinical assistant (demo)</div>
+          <div className="aiSub">Rule-based triage + episode-of-care checks + data completeness + exportable AI note</div>
+
+          <div className="aiAlertBlock">
+            <div className="aiBlockTitle">AI alerts (high visibility)</div>
+
+            <div className="aiAlertRow">
+              <TriagePill level={tri.level} />
+              <div className="aiAlertText">
+                <div className="aiAlertHeadline">Triage status: {tri.level}</div>
+                <div className="aiAlertSmall">{tri.reasons?.[0] || "—"}</div>
+              </div>
+            </div>
+
+            <div className="aiAlertRow">
+              <span className={`dotDot ${miss.length ? "dotRed" : "dotGreen"}`} />
+              <div className="aiAlertText">
+                <div className="aiAlertHeadline">
+                  Data completeness flag: {miss.length ? "missing recent vitals" : "complete"}
+                </div>
+                <div className="aiAlertSmall">
+                  {miss.length ? `${miss.map(missingLabel).join(", ")} in last ${rules.completenessHours} hours.` : "All key vitals present."}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="aiActionsCard">
+            <div className="aiBlockTitle">AI next actions (what the system recommends)</div>
+            <ul className="aiList">
+              <li>Check missing vitals and trigger a data completeness flag for clinical review.</li>
+              <li>Surface top active Conditions and current MedicationRequests in a single timeline view.</li>
+              <li>Add rule-based triage suggestions and export an AI note to PDF (Portable Document Format).</li>
+            </ul>
+          </div>
+
+          <div className="aiButtonsRow">
+            <button className="aiBtnBig" onClick={generateAiSummary} disabled={aiBusy || !selectedPatientId}>
+              {aiBusy ? "Generating…" : "Generate AI summary"}
+            </button>
+
+            <button
+              className="aiBtnGhost"
+              onClick={() => exportAiNoteToPdf(aiNoteRef.current, `AI_note_${pid}.pdf`)}
+              disabled={!aiNote || aiBusy}
+              title="Downloads a PDF directly (no browser popup)."
+            >
+              Export AI note to PDF (Portable Document Format)
+            </button>
+          </div>
+
+          <div className="aiNoteBox" ref={aiNoteRef}>
+            <div className="aiNoteTitle">AI note</div>
+            <div className="aiNoteText">{aiNote || "Click “Generate AI summary” to produce a board-ready AI note."}</div>
+          </div>
+
+          {!compact && (
+            <>
+              <div className="storyHeader">
+                <div className="aiBlockTitle">Patient story timeline (Encounter + Conditions + MedicationRequest + Observations)</div>
+                <div className="countText">{storyItems.length} items</div>
+              </div>
+
+              <div className="storyList">
+                {storyItems.map((it) => {
+                  const open = !!expandedWhy[it.id];
+                  return (
+                    <div className="storyItem" key={it.id}>
+                      <div className="storyLeft">
+                        <div className="storyKind">{it.kind}</div>
+                        <div className="storyTitle">{it.title}</div>
+                        <div className="storyWhen">{fmtDateTime(it.when)}</div>
+                      </div>
+                      <div className="storyRight">
+                        <TriagePill level={it.triage} />
+                        <button
+                          className="whyBtn"
+                          onClick={() => setExpandedWhy((prev) => ({ ...prev, [it.id]: !prev[it.id] }))}
+                        >
+                          Explain why
+                        </button>
+                        {open && (
+                          <div className="whyPanel">
+                            {(it.why || []).slice(0, 4).map((w, i) => (
+                              <div className="whyLine" key={i}>• {w}</div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          <div className="govCard">
+            <div className="bigAiTitle">Governance & model card</div>
+            <div className="govGrid">
+              <div className="govItem"><div className="govKey">Model</div><div className="govVal">{modelVersion}</div></div>
+              <div className="govItem"><div className="govKey">Last reviewed</div><div className="govVal">{modelReviewed}</div></div>
+              <div className="govItem"><div className="govKey">Data sources</div><div className="govVal">FHIR server (Fast Healthcare Interoperability Resources) demo data</div></div>
+              <div className="govItem"><div className="govKey">Clinician override</div><div className="govVal">Supported (upgrade: explicit override + reason)</div></div>
+            </div>
+            <div className="govNote">
+              Upgrade path: replace rules with a real model + audit trail, versioning, clinician override, and monitoring.
+            </div>
+
+            <div className="auditTitle">Audit trail (demo)</div>
+            <div className="auditList">
+              {audit.length === 0 ? (
+                <div className="subtle">No events yet.</div>
+              ) : (
+                audit.slice(0, 8).map((a, i) => (
+                  <div className="auditRow" key={i}>
+                    <div className="auditTs">{fmtDateTime(a.ts)}</div>
+                    <div className="auditBody">
+                      <div className="auditAction">{a.action}</div>
+                      <div className="auditDetails">{a.details}</div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ---------- Layout ---------- */
   return (
     <div className="page">
       <div className="shell">
@@ -447,47 +1046,45 @@ export default function App() {
           <div className="brandLeft">
             <div className="brandTitle">Clinical FHIR Integration Demo</div>
             <div className="brandMeta">
-              Live FHIR (Fast Healthcare Interoperability Resources) REST (Representational State Transfer) calls •
-              React + Vite • Board-ready UI (User Interface)
+              FHIR (Fast Healthcare Interoperability Resources) R4 (Release 4) • React + Vite • Public server: {FHIR_BASE_DEFAULT}
             </div>
           </div>
 
           <div className="pills">
-            <div className="pill">React + Vite</div>
-            <div className="pill">FHIR R4 (Release 4)</div>
-            <a className="pill linkPill" href={FHIR_BASE} target="_blank" rel="noreferrer">
-              Test server: {FHIR_BASE}
+            <button className={`navPill ${view === "worklist" ? "navPillActive" : ""}`} onClick={() => setView("worklist")}>
+              Worklist (AI)
+            </button>
+            <button className={`navPill ${view === "patient" ? "navPillActive" : ""}`} onClick={() => setView("patient")}>
+              Patient view
+            </button>
+            <button className={`navPill ${view === "governance" ? "navPillActive" : ""}`} onClick={() => setView("governance")}>
+              Governance & audit
+            </button>
+
+            <a className="pill linkPill" href={FHIR_BASE_DEFAULT} target="_blank" rel="noreferrer">
+              Test server
             </a>
           </div>
         </div>
 
-        {/* Search card */}
         <div className="card cardPad" style={{ marginTop: 14 }}>
-          <div className="h1" style={{ textAlign: "center" }}>
-            Patient search
-          </div>
-          <div className="subtle" style={{ textAlign: "center", marginTop: 6 }}>
-            Searches Patient resources, then pulls Observation resources (vitals / labs) and generates an AI (Artificial
-            Intelligence) summary + alerts + next actions.
+          <div className="h1">Patient search</div>
+          <div className="subtle">
+            Live FHIR REST (Representational State Transfer) calls returning FHIR JSON (JavaScript Object Notation) bundles, rendered into a clinical-style interface.
           </div>
 
           <div className="badgesRow">
-            <span className="badge">
-              <span className="dot dotGreen" /> Public demo data
-            </span>
-            <span className="badge">
-              <span className="dot" /> Standards-based integration
-            </span>
-            <span className="badge">
-              <span className="dot dotAmber" /> Deployed on Cloudflare Pages
-            </span>
+            <span className="badge"><span className="dot dotGreen" /> Public demo data</span>
+            <span className="badge"><span className="dot" /> Standards-based integration</span>
+            <span className="badge"><span className="dot dotAmber" /> Deployed on Cloudflare Pages</span>
           </div>
 
           <div className="searchGrid">
             <div>
               <div className="label">Name contains</div>
-              <input className="input" value={nameContains} onChange={(e) => setNameContains(e.target.value)} />
+              <input className="input" value={nameQuery} onChange={(e) => setNameQuery(e.target.value)} />
             </div>
+
             <div>
               <div className="label">Count</div>
               <input
@@ -496,183 +1093,110 @@ export default function App() {
                 min={1}
                 max={50}
                 value={count}
-                onChange={(e) => setCount(Number(e.target.value || 10))}
+                onChange={(e) => setCount(clamp(Number(e.target.value || 10), 1, 50))}
               />
             </div>
-            <button className="button" onClick={searchPatients} disabled={loadingPatients}>
-              {loadingPatients ? "Searching…" : "Search"}
+
+            <button className="button" onClick={searchPatients} disabled={loading}>
+              {loading ? "Searching…" : "Search"}
             </button>
           </div>
 
-          {patientsErr ? (
-            <div className="subtle" style={{ marginTop: 10, color: "rgba(210,30,45,0.95)", fontWeight: 900 }}>
-              {patientsErr}
-            </div>
-          ) : null}
+          {error ? <div className="errorBox">{error}</div> : null}
         </div>
 
-        {/* Main grid */}
-        <div className="mainGrid">
-          {/* Results list */}
-          <div className="card list">
-            <div className="listHeader">
-              <div className="sectionTitle">Results</div>
-              <div className="countText">
-                {loadingPatients ? "Loading…" : `${patients.length} patient${patients.length === 1 ? "" : "s"}`}
+        {/* MAIN */}
+        {view === "governance" ? (
+          <div className="mainGridSingle">
+            <PatientDetailsPanel compact={false} />
+          </div>
+        ) : view === "patient" ? (
+          <div className="mainGrid" style={{ marginTop: 14 }}>
+            <div className="card list">
+              <div className="listHeader">
+                <div className="sectionTitle">Results</div>
+                <div className="countText">{patients.length} patient(s)</div>
               </div>
-            </div>
 
-            {loadingPatients ? (
-              <div style={{ padding: 12 }}>
-                <div className="skel" style={{ width: "40%", margin: "10px 10px 0" }} />
-                <div className="skel" style={{ width: "90%", height: 52, margin: "10px" }} />
-                <div className="skel" style={{ width: "90%", height: 52, margin: "10px" }} />
-                <div className="skel" style={{ width: "90%", height: 52, margin: "10px" }} />
-              </div>
-            ) : patients.length === 0 ? (
-              <div className="subtle" style={{ padding: 14, fontWeight: 900 }}>
-                No patients returned.
-              </div>
-            ) : (
-              patients.map((p) => {
-                const active = selectedPatient?.id === p.id;
-                const { phone } = getTelecom(p);
+              {patients.map((p) => {
+                const active = p.id === selectedPatientId;
                 return (
                   <div
-                    key={p.id}
                     className={`row ${active ? "rowActive" : ""}`}
-                    onClick={() => setSelectedPatient(p)}
+                    key={p.id}
+                    onClick={() => setSelectedPatientId(p.id)}
                     role="button"
                     tabIndex={0}
                   >
                     <div>
-                      <div className="name">{getHumanName(p)}</div>
+                      <div className="name">{getPatientDisplayName(p)}</div>
                       <div className="small">Patient/{p.id}</div>
-                      <div className="phone">📞 Phone: {safeText(phone)}</div>
+                      <div className="phone">📞 Phone: {getPatientPhone(p)}</div>
                     </div>
-
                     <div className="metaRight">
-                      <div>{safeText(p.gender)} • {fmtDate(p.birthDate)}</div>
-                      <div style={{ marginTop: 2 }}>
-                        Identifier: {safeText(p?.identifier?.[0]?.value)}
-                      </div>
+                      <div>{getPatientGender(p)} • {getPatientDOB(p)}</div>
+                      <div>Identifier: {getPatientIdentifier(p)}</div>
                     </div>
                   </div>
                 );
-              })
-            )}
+              })}
+            </div>
+
+            <PatientDetailsPanel compact={false} />
           </div>
-
-          {/* Details */}
-          <div className="card cardPad">
-            <div className="detailsHeader">
-              <div className="sectionTitle">Patient details</div>
-              <div className="detailsName">{selectedPatient ? getHumanName(selectedPatient) : "—"}</div>
-              <div className="small">{selectedPatient ? `Patient/${selectedPatient.id}` : "Select a patient"}</div>
-            </div>
-
-            <div className="kvRow">
-              <div className="kv">
-                <span>Gender</span>
-                <div>{safeText(selectedPatient?.gender)}</div>
-              </div>
-              <div className="kv">
-                <span>Date of birth</span>
-                <div>{fmtDate(selectedPatient?.birthDate)}</div>
-              </div>
-            </div>
-
-            {/* Observations */}
-            <div className="obsHeader">
-              <div className="sectionTitle">Observations (vitals / labs)</div>
-              <div className="countText">{loadingObs ? "Loading…" : `${obsDisplays.length} items`}</div>
-            </div>
-
-            {obsErr ? (
-              <div className="subtle" style={{ marginTop: 10, color: "rgba(210,30,45,0.95)", fontWeight: 900 }}>
-                {obsErr}
-              </div>
-            ) : null}
-
-            <div className="obsGrid">
-              {loadingObs
-                ? Array.from({ length: 4 }).map((_, i) => (
-                    <div key={i} className="obsCard">
-                      <div className="skel" style={{ width: "44%" }} />
-                      <div className="skel" style={{ width: "68%", height: 16, marginTop: 10 }} />
-                      <div className="skel" style={{ width: "52%", marginTop: 10 }} />
-                    </div>
-                  ))
-                : vitalsCards.map((v) => <VitalCard key={v.label} label={v.label} value={v.value} when={v.when} />)}
-            </div>
-
-            {/* Timeline */}
-            <div className="timelineTitle">Recent timeline</div>
-            {loadingObs ? (
-              <div style={{ marginTop: 8 }}>
-                <div className="skel" style={{ width: "100%", height: 44, borderRadius: 14, marginTop: 8 }} />
-                <div className="skel" style={{ width: "100%", height: 44, borderRadius: 14, marginTop: 8 }} />
-                <div className="skel" style={{ width: "100%", height: 44, borderRadius: 14, marginTop: 8 }} />
-              </div>
-            ) : (
-              timelineItems.map((t, idx) => (
-                <div key={`${t.label}-${idx}-${t.when}`} className="timelineItem">
-                  <div className="timelineLeft">
-                    <div className="timelineName">{t.label}</div>
-                    <div className="timelineWhen">{t.when}</div>
-                  </div>
-                  <div className="timelineRight">{t.value}</div>
+        ) : (
+          // WORKLIST MODE (AI cockpit)
+          <div className="worklistGrid" style={{ marginTop: 14 }}>
+            <div className="card cardPad">
+              <div className="worklistTop">
+                <div>
+                  <div className="bigAiTitle">AI triage worklist</div>
+                  <div className="subtle">Queue intelligence view: risk flags, missing-data flags, and quick patient preview.</div>
                 </div>
-              ))
-            )}
 
-            {/* AI Panel */}
-            <div className="aiPanel">
-              <div className="aiHeader">
-                <div className="aiTitle">AI summary (demo)</div>
-
-                <div className="aiMode" title="Toggle between local AI and a real AI endpoint (if configured)">
-                  Real AI endpoint
-                  <input
-                    className="toggle"
-                    type="checkbox"
-                    checked={useRealAi}
-                    onChange={(e) => setUseRealAi(e.target.checked)}
-                  />
+                <div className="kpiRow">
+                  <div className="kpi"><div className="kpiKey">RED</div><div className="kpiVal">{worklistStats.RED}</div></div>
+                  <div className="kpi"><div className="kpiKey">AMBER</div><div className="kpiVal">{worklistStats.AMBER}</div></div>
+                  <div className="kpi"><div className="kpiKey">GREEN</div><div className="kpiVal">{worklistStats.GREEN}</div></div>
+                  <div className="kpi"><div className="kpiKey">Missing data</div><div className="kpiVal">{worklistStats.MISSING}</div></div>
                 </div>
               </div>
 
-              {/* AI Alerts chips */}
-              <div className="badgesRow" style={{ marginTop: 10 }}>
-                {(aiInsights?.alerts || []).slice(0, 4).map((a, i) => (
-                  <span key={i} className="badge">
-                    <span className={levelDotClass(a.level)} /> {a.text}
-                  </span>
+              <div className="worklistControls">
+                <div className="chipGroup">
+                  {["ALL", "RED", "AMBER", "GREEN", "MISSING"].map((x) => (
+                    <button
+                      key={x}
+                      className={`chip ${worklistFilter === x ? "chipActive" : ""}`}
+                      onClick={() => setWorklistFilter(x)}
+                    >
+                      {x === "ALL" ? "All" : x === "MISSING" ? "Missing data" : x}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="sortGroup">
+                  <span className="sortLabel">Sort</span>
+                  <select className="select" value={sortMode} onChange={(e) => setSortMode(e.target.value)}>
+                    <option value="RISK">Risk</option>
+                    <option value="RECENT">Most recent encounter</option>
+                    <option value="NAME">Name</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="worklistList">
+                {filteredWorklist.map(({ p, snap }) => (
+                  <WorklistRow key={p.id} p={p} snap={snap} />
                 ))}
               </div>
-
-              <div className="aiRow">
-                <button className="aiBtn" onClick={generateAiSummary} disabled={aiBusy || !selectedPatient}>
-                  {aiBusy ? "Generating…" : "Generate summary"}
-                </button>
-                <div className="aiMini">
-                  Generates a short “clinical note” from Patient demographics + latest Observations.
-                </div>
-              </div>
-
-              <div className="aiTextBox">
-                {aiSummary
-                  ? aiSummary
-                  : "Click “Generate summary” to produce an AI clinical narrative + alerts + next actions + data quality checks."}
-              </div>
             </div>
 
-            <div className="subtle" style={{ marginTop: 12, textAlign: "center", fontWeight: 900 }}>
-              Next upgrade: add mini sparklines + Conditions + MedicationRequests + Encounter timeline for a full AI patient
-              story.
+            <div className="stickyRight">
+              <PatientDetailsPanel compact={true} />
             </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );
