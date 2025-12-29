@@ -31,17 +31,36 @@ body{
 }
 
 /* Top bar */
-.topBar{
+/* Top bar */
+.topBar {
   background: linear-gradient(90deg, var(--nhs-blue), #0a78d1);
-  color:#fff;
+  color: #fff;
   border-radius: var(--radius-xl);
-  padding:16px 18px;
+  padding: 16px 18px;
   box-shadow: var(--shadow);
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+
+  /* Make it fixed at the top center */
+  position: fixed;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(1680px, 96vw);
+  z-index: 1000; /* Keeps it on top */
 }
+
+/* Page layout: add padding-top so content starts below the fixed bar */
+.page {
+  min-height: 100vh;
+  padding: 80px 18px 40px; /* top padding increased to fit the fixed header */
+  overflow: visible;
+}
+
+
+
 .brandLeft{ display:flex; flex-direction:column; gap:2px; }
 .brandTitle{ font-weight:900; letter-spacing:0.2px; font-size:18px; }
 .brandMeta{ font-size:12px; opacity:0.92; }
