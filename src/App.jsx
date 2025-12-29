@@ -1,624 +1,680 @@
-import { useEffect, useMemo, useState } from "react";
-import "./App.css";
+import React, { useEffect, useMemo, useState } from "react";
 
+/**
+ * FHIR = Fast Healthcare Interoperability Resources
+ * HL7 = Health Level Seven
+ *
+ * Demo server (public): HAPI FHIR R4
+ */
 const FHIR_BASE = "https://hapi.fhir.org/baseR4";
 
-/** ---------- tiny helpers ---------- */
-function safeArr(x) {
-  return Array.isArray(x) ? x : [];
+function safeText(x) {
+  return typeof x === "string" ? x : "";
 }
 
-function getHumanName(nameArr) {
-  const a = safeArr(nameArr);
-  if (!a.length) return "Unnamed";
-  const n = a[0] || {};
-  const given = safeArr(n.given).join(" ");
-  const family = n.family || "";
-  return `${given} ${family}`.trim() || "Unnamed";
+function pickPatientName(patient) {
+  const n = patient?.name?.[0];
+  if (!n) return "Unnamed patient";
+  if (n.text) return n.text;
+  const given = Array.isArray(n.given) ? n.given.join(" ") : "";
+  const family = n.family ? String(n.family) : "";
+  return `${given} ${family}`.trim() || "Unnamed patient";
 }
 
-function getFirstTelecom(telecomArr, system) {
-  const a = safeArr(telecomArr);
-  const match = a.find((t) => t?.system === system && t?.value);
-  return match?.value || "";
+function pickPhone(patient) {
+  const t = (patient?.telecom || []).find((x) => x?.system === "phone");
+  return t?.value ? String(t.value) : "—";
 }
 
-function fmtDate(iso) {
-  if (!iso) return "—";
-  // handles YYYY-MM-DD or full ISO
+function pickIdentifier(patient) {
+  const id = patient?.identifier?.[0]?.value;
+  return id ? String(id) : "—";
+}
+
+function pickGender(patient) {
+  return patient?.gender ? String(patient.gender) : "—";
+}
+
+function pickBirthDate(patient) {
+  return patient?.birthDate ? String(patient.birthDate) : "—";
+}
+
+function formatWhen(obs) {
+  const dt =
+    obs?.effectiveDateTime ||
+    obs?.effectivePeriod?.start ||
+    obs?.issued ||
+    "";
+  if (!dt) return "—";
+  // keep it simple + readable
   try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    const d = new Date(dt);
+    if (Number.isNaN(d.getTime())) return String(dt);
+    return d.toLocaleString();
   } catch {
-    return iso;
+    return String(dt);
   }
 }
 
-function pickObsDate(obs) {
-  return (
-    obs?.effectiveDateTime ||
-    obs?.effectivePeriod?.end ||
-    obs?.effectivePeriod?.start ||
-    obs?.issued ||
-    null
-  );
-}
-
-function getCodingCodeDisplay(codeObj) {
-  const coding = safeArr(codeObj?.coding);
-  const c =
-    coding.find((x) => (x?.system || "").toLowerCase().includes("loinc")) ||
-    coding[0] ||
-    null;
-
-  return {
-    code: c?.code || "",
-    display: c?.display || codeObj?.text || "",
-    system: c?.system || "",
-  };
+function getObsDisplay(obs) {
+  const code = obs?.code;
+  const text =
+    code?.text ||
+    code?.coding?.[0]?.display ||
+    code?.coding?.[0]?.code ||
+    "Observation";
+  return String(text);
 }
 
 function getObsValueText(obs) {
-  if (obs?.valueQuantity?.value != null) {
-    const v = obs.valueQuantity.value;
-    const u = obs.valueQuantity.unit || obs.valueQuantity.code || "";
-    return `${v}${u ? " " + u : ""}`;
+  // blood pressure often arrives as components
+  const comps = obs?.component;
+  if (Array.isArray(comps) && comps.length) {
+    const sys = comps.find((c) =>
+      (c?.code?.coding || []).some((k) => k?.code === "8480-6") // Systolic
+    );
+    const dia = comps.find((c) =>
+      (c?.code?.coding || []).some((k) => k?.code === "8462-4") // Diastolic
+    );
+    const sysV = sys?.valueQuantity?.value;
+    const diaV = dia?.valueQuantity?.value;
+    const unit =
+      sys?.valueQuantity?.unit ||
+      dia?.valueQuantity?.unit ||
+      "mmHg";
+    if (sysV != null && diaV != null) return `${sysV}/${diaV} ${unit}`;
   }
-  if (obs?.valueString) return obs.valueString;
-  if (obs?.valueCodeableConcept?.text) return obs.valueCodeableConcept.text;
-  const cd = safeArr(obs?.valueCodeableConcept?.coding)[0];
-  if (cd?.display) return cd.display;
-  if (obs?.valueBoolean != null) return obs.valueBoolean ? "Yes" : "No";
-  if (obs?.valueInteger != null) return String(obs.valueInteger);
+
+  const vq = obs?.valueQuantity;
+  if (vq?.value != null) {
+    const unit = vq.unit || vq.code || "";
+    return `${vq.value}${unit ? " " + unit : ""}`.trim();
+  }
+
+  if (obs?.valueString) return String(obs.valueString);
+  if (obs?.valueCodeableConcept?.text) return String(obs.valueCodeableConcept.text);
+
   return "—";
 }
 
-/** ---------- vitals extraction (LOINC codes) ---------- */
-const LOINC = {
-  HR: "8867-4", // Heart rate
-  RR: "9279-1", // Respiratory rate
-  TEMP: "8310-5", // Body temperature
-  SPO2: "59408-5", // Oxygen saturation
-  BP_PANEL: "85354-9", // Blood pressure panel
-  SBP: "8480-6",
-  DBP: "8462-4",
-};
+/**
+ * Try to recognise common vital signs / labs.
+ * We use a mix of well-known LOINC codes + fallback text matching (demo-friendly).
+ */
+function classifyObservation(obs) {
+  const coding = obs?.code?.coding || [];
+  const codes = new Set(coding.map((c) => String(c.code || "")));
 
-function extractLatestVitals(observations) {
-  // Expect observations sorted newest-first (we’ll do that in the query).
-  let hr = null,
-    rr = null,
-    temp = null,
-    spo2 = null,
-    sbp = null,
-    dbp = null;
+  const text = (getObsDisplay(obs) + " " + (coding?.[0]?.display || "")).toLowerCase();
 
-  for (const obs of observations) {
-    const { code } = getCodingCodeDisplay(obs?.code);
+  // Blood pressure panel
+  if (codes.has("85354-9") || codes.has("55284-4") || text.includes("blood pressure")) return "bp";
 
-    // BP can arrive as a panel with components
-    if (code === LOINC.BP_PANEL) {
-      const comps = safeArr(obs?.component);
-      const s = comps.find((c) => getCodingCodeDisplay(c?.code).code === LOINC.SBP);
-      const d = comps.find((c) => getCodingCodeDisplay(c?.code).code === LOINC.DBP);
-      if (!sbp && s?.valueQuantity?.value != null) sbp = { obs, value: getObsValueText({ valueQuantity: s.valueQuantity }) };
-      if (!dbp && d?.valueQuantity?.value != null) dbp = { obs, value: getObsValueText({ valueQuantity: d.valueQuantity }) };
-    }
+  // Heart rate
+  if (codes.has("8867-4") || text.includes("heart rate") || text.includes("pulse")) return "hr";
 
-    // Sometimes SBP/DBP arrive as separate Observations
-    if (code === LOINC.SBP && !sbp) sbp = { obs, value: getObsValueText(obs) };
-    if (code === LOINC.DBP && !dbp) dbp = { obs, value: getObsValueText(obs) };
+  // Temperature
+  if (codes.has("8310-5") || text.includes("temperature") || text.includes("temp")) return "temp";
 
-    if (code === LOINC.HR && !hr) hr = { obs, value: getObsValueText(obs) };
-    if (code === LOINC.RR && !rr) rr = { obs, value: getObsValueText(obs) };
-    if (code === LOINC.TEMP && !temp) temp = { obs, value: getObsValueText(obs) };
-    if (code === LOINC.SPO2 && !spo2) spo2 = { obs, value: getObsValueText(obs) };
+  // Oxygen saturation
+  if (codes.has("59408-5") || text.includes("oxygen saturation") || text.includes("spo2")) return "spo2";
 
-    if (hr && rr && temp && spo2 && sbp && dbp) break;
-  }
+  // Haemoglobin
+  if (codes.has("718-7") || text.includes("hemoglobin") || text.includes("haemoglobin")) return "hgb";
 
-  return { hr, rr, temp, spo2, sbp, dbp };
+  // Weight
+  if (codes.has("29463-7") || codes.has("3141-9") || text.includes("weight")) return "wt";
+
+  return "other";
 }
 
-/** ---------- UI styles (NHS-ish: calm, clean, clinical) ---------- */
+function pickLatestByType(observations) {
+  // Observations are fetched sorted newest-first; we pick first seen per type.
+  const latest = {};
+  for (const obs of observations) {
+    const t = classifyObservation(obs);
+    if (!latest[t]) latest[t] = obs;
+  }
+  return latest;
+}
+
+function aiSummaryFrom(patient, latest) {
+  const name = pickPatientName(patient);
+  const gender = pickGender(patient);
+  const dob = pickBirthDate(patient);
+
+  const lines = [];
+  lines.push(`Patient: ${name} (gender: ${gender}, date of birth: ${dob})`);
+
+  const vitals = [];
+  if (latest.bp) vitals.push(`Blood pressure: ${getObsValueText(latest.bp)} (${formatWhen(latest.bp)})`);
+  if (latest.hr) vitals.push(`Heart rate: ${getObsValueText(latest.hr)} (${formatWhen(latest.hr)})`);
+  if (latest.temp) vitals.push(`Temperature: ${getObsValueText(latest.temp)} (${formatWhen(latest.temp)})`);
+  if (latest.spo2) vitals.push(`Oxygen saturation: ${getObsValueText(latest.spo2)} (${formatWhen(latest.spo2)})`);
+  if (latest.hgb) vitals.push(`Haemoglobin: ${getObsValueText(latest.hgb)} (${formatWhen(latest.hgb)})`);
+  if (latest.wt) vitals.push(`Weight: ${getObsValueText(latest.wt)} (${formatWhen(latest.wt)})`);
+
+  if (vitals.length) {
+    lines.push("");
+    lines.push("Latest observations:");
+    for (const v of vitals) lines.push(`• ${v}`);
+  } else {
+    lines.push("");
+    lines.push("Latest observations: none returned by the demo server for this patient.");
+  }
+
+  // Very simple “flags” (purely demo logic)
+  const flags = [];
+
+  // temp > 37.8
+  if (latest.temp?.valueQuantity?.value != null) {
+    const t = Number(latest.temp.valueQuantity.value);
+    if (!Number.isNaN(t) && t >= 37.8) flags.push("Raised temperature recorded.");
+  }
+  // spo2 < 94
+  if (latest.spo2?.valueQuantity?.value != null) {
+    const s = Number(latest.spo2.valueQuantity.value);
+    if (!Number.isNaN(s) && s < 94) flags.push("Low oxygen saturation recorded.");
+  }
+  // HR > 100
+  if (latest.hr?.valueQuantity?.value != null) {
+    const h = Number(latest.hr.valueQuantity.value);
+    if (!Number.isNaN(h) && h > 100) flags.push("Raised heart rate recorded.");
+  }
+
+  if (flags.length) {
+    lines.push("");
+    lines.push("Attention flags:");
+    for (const f of flags) lines.push(`• ${f}`);
+  }
+
+  lines.push("");
+  lines.push("Summary generated locally for demo purposes (no external AI call).");
+
+  return lines.join("\n");
+}
+
 const ui = {
   page: {
     minHeight: "100vh",
-    background:
-      "radial-gradient(1200px 600px at 20% -10%, rgba(0,94,184,0.16), transparent 60%), radial-gradient(1000px 600px at 100% 0%, rgba(0,140,255,0.10), transparent 55%), linear-gradient(180deg, rgba(245,249,255,1), rgba(250,251,252,1))",
+    background: "linear-gradient(180deg, #eef5ff 0%, #ffffff 55%)",
+    padding: 28,
+    fontFamily:
+      'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"',
     color: "#0b1b2b",
   },
-  shell: { maxWidth: 1240, margin: "0 auto", padding: 20 },
+  shell: {
+    maxWidth: 1200,
+    margin: "0 auto",
+  },
   topBar: {
-    borderRadius: 18,
+    borderRadius: 14,
     padding: "14px 16px",
-    background: "linear-gradient(90deg, rgba(0,94,184,1), rgba(0,140,255,0.92))",
+    background: "linear-gradient(90deg, #0b63ce 0%, #1479e6 60%, #0b63ce 100%)",
     color: "white",
-    boxShadow: "0 10px 30px rgba(0,30,80,0.18)",
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 12,
+    boxShadow: "0 10px 30px rgba(11, 99, 206, 0.25)",
   },
-  titleWrap: { display: "flex", alignItems: "center", gap: 12 },
-  badge: {
+  titleRow: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" },
+  title: { fontSize: 16, fontWeight: 900, letterSpacing: 0.2 },
+  chip: {
     background: "rgba(255,255,255,0.18)",
-    border: "1px solid rgba(255,255,255,0.25)",
-    padding: "6px 10px",
+    border: "1px solid rgba(255,255,255,0.28)",
+    padding: "4px 10px",
     borderRadius: 999,
     fontSize: 12,
     fontWeight: 700,
-    letterSpacing: 0.2,
   },
   card: {
-    background: "white",
-    border: "1px solid rgba(10, 30, 60, 0.10)",
-    borderRadius: 18,
-    boxShadow: "0 8px 22px rgba(10, 30, 60, 0.06)",
+    background: "rgba(255,255,255,0.9)",
+    border: "1px solid rgba(11, 27, 43, 0.10)",
+    borderRadius: 16,
+    boxShadow: "0 12px 28px rgba(11, 27, 43, 0.10)",
   },
-  subtle: { color: "rgba(11,27,43,0.72)" },
-  grid: { display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 14, marginTop: 14, alignItems: "start" },
-  input: {
-    width: "100%",
-    padding: "10px 12px",
-    borderRadius: 12,
-    border: "1px solid rgba(10,30,60,0.16)",
-    background: "rgba(250,252,255,1)",
-    color: "inherit",
-    outline: "none",
-  },
-  label: { display: "block", fontSize: 12, fontWeight: 700, color: "rgba(11,27,43,0.70)", marginBottom: 6 },
-  btn: (disabled) => ({
-    padding: "10px 12px",
-    borderRadius: 14,
-    border: "1px solid rgba(10,30,60,0.16)",
-    background: disabled ? "rgba(10,30,60,0.06)" : "rgba(0,94,184,1)",
-    color: disabled ? "rgba(11,27,43,0.55)" : "white",
-    cursor: disabled ? "not-allowed" : "pointer",
-    fontWeight: 800,
-    letterSpacing: 0.2,
-    boxShadow: disabled ? "none" : "0 10px 18px rgba(0,94,184,0.18)",
-  }),
+  section: { marginTop: 16, padding: 18 },
+  h2: { margin: 0, fontSize: 22, fontWeight: 900 },
+  subtle: { opacity: 0.75, fontSize: 13, marginTop: 6 },
+  pills: { display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 },
   pill: {
     display: "inline-flex",
     alignItems: "center",
     gap: 8,
-    padding: "8px 10px",
+    padding: "6px 10px",
     borderRadius: 999,
-    border: "1px solid rgba(10,30,60,0.12)",
-    background: "rgba(250,252,255,1)",
+    border: "1px solid rgba(11, 27, 43, 0.12)",
+    background: "white",
     fontSize: 12,
-    fontWeight: 800,
+    fontWeight: 700,
+  },
+  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 14 },
+  inputsRow: {
+    display: "grid",
+    gridTemplateColumns: "1.2fr 0.4fr 0.4fr",
+    gap: 12,
+    alignItems: "end",
+    marginTop: 12,
+  },
+  label: { fontSize: 12, fontWeight: 800, opacity: 0.75, marginBottom: 6 },
+  input: {
+    width: "100%",
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid rgba(11, 27, 43, 0.16)",
+    outline: "none",
+    fontSize: 13,
+    background: "white",
+  },
+  button: {
+    padding: "10px 14px",
+    borderRadius: 12,
+    border: "1px solid rgba(11, 99, 206, 0.25)",
+    background: "#0b63ce",
+    color: "white",
+    fontWeight: 900,
+    cursor: "pointer",
+    boxShadow: "0 12px 20px rgba(11, 99, 206, 0.25)",
+  },
+  layout: { display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 14, marginTop: 14 },
+  listHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "baseline",
+    marginBottom: 10,
+  },
+  listTitle: { fontWeight: 900 },
+  smallCount: { fontSize: 12, opacity: 0.65 },
+  patientCard: (active) => ({
+    borderRadius: 14,
+    border: active ? "1px solid rgba(11, 99, 206, 0.55)" : "1px solid rgba(11, 27, 43, 0.10)",
+    background: active ? "rgba(11, 99, 206, 0.06)" : "white",
+    padding: 14,
+    marginBottom: 10,
+    cursor: "pointer",
+    boxShadow: active ? "0 10px 22px rgba(11, 99, 206, 0.12)" : "none",
+  }),
+  rowBetween: { display: "flex", justifyContent: "space-between", gap: 10 },
+  patientName: { fontSize: 16, fontWeight: 900 },
+  meta: { fontSize: 12, opacity: 0.7, marginTop: 2 },
+  rightMeta: { textAlign: "right", fontSize: 12, opacity: 0.8 },
+  vitalsGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 },
+  vitalCard: {
+    padding: 10,
+    borderRadius: 14,
+    border: "1px solid rgba(11, 27, 43, 0.10)",
+    background: "white",
+  },
+  vitalLabel: { fontSize: 11, fontWeight: 900, opacity: 0.7 },
+  vitalValue: { fontSize: 18, fontWeight: 950, marginTop: 4 },
+  vitalWhen: { fontSize: 11, opacity: 0.6, marginTop: 4 },
+  timeline: {
+    marginTop: 10,
+    borderRadius: 14,
+    border: "1px solid rgba(11, 27, 43, 0.10)",
+    background: "white",
+    overflow: "hidden",
+  },
+  tlItem: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    padding: "10px 12px",
+    borderTop: "1px solid rgba(11, 27, 43, 0.06)",
+  },
+  tlLeft: { fontSize: 12, fontWeight: 800 },
+  tlSub: { fontSize: 11, opacity: 0.6, marginTop: 2 },
+  tlRight: { fontSize: 12, fontWeight: 900, whiteSpace: "nowrap" },
+  aiBox: {
+    marginTop: 12,
+    borderRadius: 14,
+    border: "1px solid rgba(11, 27, 43, 0.10)",
+    background: "white",
+    padding: 12,
+  },
+  aiText: {
+    marginTop: 10,
+    whiteSpace: "pre-wrap",
+    fontFamily:
+      'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+    fontSize: 12,
+    lineHeight: 1.45,
+    borderRadius: 12,
+    border: "1px solid rgba(11, 27, 43, 0.10)",
+    padding: 10,
+    background: "rgba(11,99,206,0.03)",
+    maxHeight: 220,
+    overflow: "auto",
   },
 };
 
 export default function App() {
-  const [q, setQ] = useState("smith");
+  const [query, setQuery] = useState("smith");
   const [count, setCount] = useState(10);
 
   const [loadingPatients, setLoadingPatients] = useState(false);
+  const [patients, setPatients] = useState([]);
   const [errorPatients, setErrorPatients] = useState("");
-  const [bundle, setBundle] = useState(null);
 
-  const [selectedPatientId, setSelectedPatientId] = useState("");
-
+  const [selectedPatient, setSelectedPatient] = useState(null);
   const [loadingObs, setLoadingObs] = useState(false);
+  const [observations, setObservations] = useState([]);
   const [errorObs, setErrorObs] = useState("");
-  const [obsBundle, setObsBundle] = useState(null);
 
-  const patients = useMemo(() => {
-    const entries = bundle?.entry || [];
-    return entries.map((e) => e.resource).filter((r) => r?.resourceType === "Patient");
-  }, [bundle]);
-
-  const selectedPatient = useMemo(() => {
-    return patients.find((p) => p.id === selectedPatientId) || null;
-  }, [patients, selectedPatientId]);
-
-  const observations = useMemo(() => {
-    const entries = obsBundle?.entry || [];
-    const obs = entries.map((e) => e.resource).filter((r) => r?.resourceType === "Observation");
-
-    // Sort newest-first by effective/issued
-    obs.sort((a, b) => {
-      const da = new Date(pickObsDate(a) || 0).getTime();
-      const db = new Date(pickObsDate(b) || 0).getTime();
-      return db - da;
-    });
-
-    return obs;
-  }, [obsBundle]);
-
-  const vitals = useMemo(() => extractLatestVitals(observations), [observations]);
+  const [aiSummary, setAiSummary] = useState("");
 
   async function searchPatients() {
     setLoadingPatients(true);
     setErrorPatients("");
-    setBundle(null);
-
+    setAiSummary("");
     try {
-      const url = new URL(`${FHIR_BASE}/Patient`);
-      url.searchParams.set("_count", String(count));
-      if (q.trim()) url.searchParams.set("name", q.trim());
+      const url = `${FHIR_BASE}/Patient?name=${encodeURIComponent(query)}&_count=${encodeURIComponent(
+        String(count || 10)
+      )}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Patient search failed (${res.status})`);
+      const bundle = await res.json();
+      const list = (bundle?.entry || []).map((e) => e.resource).filter(Boolean);
+      setPatients(list);
 
-      const res = await fetch(url.toString(), { headers: { Accept: "application/fhir+json" } });
-      if (!res.ok) throw new Error(`FHIR Patient search failed (${res.status})`);
-
-      const data = await res.json();
-      if (data?.resourceType !== "Bundle") throw new Error("Unexpected Patient response (not a FHIR Bundle).");
-
-      setBundle(data);
-
-      const first = (data.entry || []).map((e) => e.resource).find((r) => r?.resourceType === "Patient");
-      setSelectedPatientId(first?.id || "");
+      if (list.length) {
+        setSelectedPatient(list[0]);
+      } else {
+        setSelectedPatient(null);
+        setObservations([]);
+      }
     } catch (e) {
-      setErrorPatients(e?.message || "Unknown patient error");
+      setErrorPatients(e?.message || "Failed to search patients.");
+      setPatients([]);
+      setSelectedPatient(null);
+      setObservations([]);
     } finally {
       setLoadingPatients(false);
     }
   }
 
-  async function fetchObservationsForPatient(patientId) {
-    if (!patientId) return;
-
+  async function fetchObservationsForPatient(patient) {
+    if (!patient?.id) return;
     setLoadingObs(true);
     setErrorObs("");
-    setObsBundle(null);
-
+    setAiSummary("");
     try {
-      const url = new URL(`${FHIR_BASE}/Observation`);
-      // Most servers accept either subject=Patient/{id} or patient={id}; we’ll use subject.
-      url.searchParams.set("subject", `Patient/${patientId}`);
-      url.searchParams.set("_count", "80");
-      url.searchParams.set("_sort", "-date");
+      // Try patient= first (common); if empty, fallback to subject=Patient/{id}
+      const url1 = `${FHIR_BASE}/Observation?patient=${encodeURIComponent(
+        patient.id
+      )}&_sort=-date&_count=50`;
+      const res1 = await fetch(url1);
+      if (!res1.ok) throw new Error(`Observation fetch failed (${res1.status})`);
+      const bundle1 = await res1.json();
+      let obs = (bundle1?.entry || []).map((e) => e.resource).filter(Boolean);
 
-      const res = await fetch(url.toString(), { headers: { Accept: "application/fhir+json" } });
-      if (!res.ok) throw new Error(`FHIR Observation search failed (${res.status})`);
+      if (!obs.length) {
+        const url2 = `${FHIR_BASE}/Observation?subject=Patient/${encodeURIComponent(
+          patient.id
+        )}&_sort=-date&_count=50`;
+        const res2 = await fetch(url2);
+        if (res2.ok) {
+          const bundle2 = await res2.json();
+          obs = (bundle2?.entry || []).map((e) => e.resource).filter(Boolean);
+        }
+      }
 
-      const data = await res.json();
-      if (data?.resourceType !== "Bundle") throw new Error("Unexpected Observation response (not a FHIR Bundle).");
-
-      setObsBundle(data);
+      setObservations(obs);
     } catch (e) {
-      setErrorObs(e?.message || "Unknown observation error");
+      setErrorObs(e?.message || "Failed to fetch observations.");
+      setObservations([]);
     } finally {
       setLoadingObs(false);
     }
   }
 
-  // initial load
   useEffect(() => {
+    // initial load
     searchPatients();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // load observations when selection changes
   useEffect(() => {
-    if (selectedPatientId) fetchObservationsForPatient(selectedPatientId);
+    // load observations when selection changes
+    if (selectedPatient?.id) fetchObservationsForPatient(selectedPatient);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPatientId]);
+  }, [selectedPatient?.id]);
+
+  const latest = useMemo(() => pickLatestByType(observations), [observations]);
+
+  function VitalCard({ label, obs }) {
+    return (
+      <div style={ui.vitalCard}>
+        <div style={ui.vitalLabel}>{label}</div>
+        <div style={ui.vitalValue}>{obs ? getObsValueText(obs) : "—"}</div>
+        <div style={ui.vitalWhen}>{obs ? formatWhen(obs) : "—"}</div>
+      </div>
+    );
+  }
+
+  function onSelect(p) {
+    setSelectedPatient(p);
+  }
+
+  function onGenerateSummary() {
+    if (!selectedPatient) return;
+    const text = aiSummaryFrom(selectedPatient, latest);
+    setAiSummary(text);
+  }
 
   return (
     <div style={ui.page}>
       <div style={ui.shell}>
         <div style={ui.topBar}>
-          <div style={ui.titleWrap}>
-            <div style={{ fontSize: 18, fontWeight: 900, letterSpacing: 0.2 }}>Clinical FHIR Integration Demo</div>
-            <div style={ui.badge}>React + Vite</div>
-            <div style={ui.badge}>FHIR R4 (Release 4)</div>
+          <div style={ui.titleRow}>
+            <div style={ui.title}>Clinical FHIR Integration Demo</div>
+            <span style={ui.chip}>React + Vite</span>
+            <span style={ui.chip}>FHIR R4 (Release 4)</span>
           </div>
-          <div style={{ fontSize: 12, opacity: 0.92 }}>
-            Test server: <span style={{ fontWeight: 900 }}>{FHIR_BASE}</span>
+          <div style={{ fontSize: 12, opacity: 0.95, fontWeight: 800 }}>
+            Test server:{" "}
+            <span style={{ textDecoration: "underline" }}>
+              {FHIR_BASE}
+            </span>
           </div>
         </div>
 
-        <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
-          <div style={{ ...ui.card, padding: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
-              <div>
-                <div style={{ fontSize: 22, fontWeight: 950, marginBottom: 4 }}>Patient search</div>
-                <div style={ui.subtle}>
-                  Live FHIR REST calls returning FHIR JSON Bundles, rendered into a clinical-style interface.
-                </div>
-              </div>
-
-              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                <span style={ui.pill}>✅ Public demo data</span>
-                <span style={ui.pill}>🔌 Standards-based integration</span>
-                <span style={ui.pill}>☁️ Deployed on Cloudflare Pages</span>
-              </div>
+        <section style={{ ...ui.card, ...ui.section }}>
+          <div style={{ textAlign: "center" }}>
+            <h2 style={ui.h2}>Patient search</h2>
+            <div style={ui.subtle}>
+              Live FHIR REST calls returning FHIR JSON bundles, rendered into a clinical-style interface.
             </div>
 
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "1fr 140px 140px",
-                gap: 10,
-                alignItems: "end",
-                marginTop: 12,
-              }}
-            >
-              <div>
-                <label style={ui.label}>Name contains</label>
-                <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="e.g. smith" style={ui.input} />
-              </div>
+            <div style={ui.pills}>
+              <span style={ui.pill}>✅ Public demo data</span>
+              <span style={ui.pill}>📎 Standards-based integration</span>
+              <span style={ui.pill}>☁️ Deployed on Cloudflare Pages</span>
+            </div>
+          </div>
 
-              <div>
-                <label style={ui.label}>Count</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={50}
-                  value={count}
-                  onChange={(e) => setCount(Number(e.target.value))}
-                  style={ui.input}
-                />
-              </div>
+          <div style={ui.inputsRow}>
+            <div>
+              <div style={ui.label}>Name contains</div>
+              <input
+                style={ui.input}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="e.g. smith"
+              />
+            </div>
 
-              <button onClick={searchPatients} disabled={loadingPatients} style={ui.btn(loadingPatients)}>
-                {loadingPatients ? "Loading…" : "Search"}
+            <div>
+              <div style={ui.label}>Count</div>
+              <input
+                style={ui.input}
+                type="number"
+                min={1}
+                max={50}
+                value={count}
+                onChange={(e) => setCount(Number(e.target.value || 10))}
+              />
+            </div>
+
+            <div>
+              <div style={ui.label}>&nbsp;</div>
+              <button style={ui.button} onClick={searchPatients} disabled={loadingPatients}>
+                {loadingPatients ? "Searching…" : "Search"}
               </button>
             </div>
-
-            {errorPatients && (
-              <div
-                style={{
-                  marginTop: 12,
-                  padding: 12,
-                  borderRadius: 14,
-                  border: "1px solid rgba(220,50,50,0.25)",
-                  background: "rgba(220,50,50,0.06)",
-                }}
-              >
-                <strong>Patient error:</strong> {errorPatients}
-              </div>
-            )}
           </div>
 
-          <div style={ui.grid}>
-            {/* LEFT: results */}
-            <section style={{ ...ui.card, padding: 14 }}>
-              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
-                <h2 style={{ margin: 0, fontSize: 16, letterSpacing: 0.2 }}>Results</h2>
-                <div style={{ fontSize: 12, color: "rgba(11,27,43,0.65)" }}>
-                  {patients.length ? `${patients.length} patients` : "—"}
+          {(errorPatients || errorObs) && (
+            <div style={{ marginTop: 12, color: "#8a0000", fontWeight: 800 }}>
+              {safeText(errorPatients || errorObs)}
+            </div>
+          )}
+
+          <div style={ui.layout}>
+            {/* LEFT: Results */}
+            <div style={{ ...ui.card, padding: 14 }}>
+              <div style={ui.listHeader}>
+                <div style={ui.listTitle}>Results</div>
+                <div style={ui.smallCount}>
+                  {patients.length} patient{patients.length === 1 ? "" : "s"}
                 </div>
               </div>
 
-              <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-                {patients.map((p) => {
-                  const isSelected = p.id === selectedPatientId;
-                  const name = getHumanName(p.name);
-                  const gender = p.gender || "unknown";
-                  const dob = p.birthDate || "—";
-                  const phone = getFirstTelecom(p.telecom, "phone");
-                  const email = getFirstTelecom(p.telecom, "email");
-
-                  const identifier =
-                    (p.identifier || []).find((id) => (id?.system || "").toLowerCase().includes("nhs"))?.value ||
-                    (p.identifier || [])[0]?.value ||
-                    "—";
-
-                  return (
-                    <button
-                      key={p.id}
-                      onClick={() => setSelectedPatientId(p.id)}
-                      style={{
-                        textAlign: "left",
-                        width: "100%",
-                        padding: 12,
-                        borderRadius: 16,
-                        border: isSelected ? "1px solid rgba(0,94,184,0.35)" : "1px solid rgba(10,30,60,0.10)",
-                        background: isSelected ? "rgba(0,94,184,0.06)" : "white",
-                        cursor: "pointer",
-                        boxShadow: isSelected ? "0 10px 20px rgba(0,94,184,0.08)" : "none",
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                        <div>
-                          <div style={{ fontSize: 16, fontWeight: 900 }}>{name}</div>
-                          <div style={{ marginTop: 2, fontSize: 12, color: "rgba(11,27,43,0.70)" }}>
-                            <code>Patient/{p.id}</code>
-                          </div>
-                        </div>
-
-                        <div style={{ textAlign: "right", fontSize: 12, color: "rgba(11,27,43,0.72)" }}>
-                          <div style={{ fontWeight: 900 }}>
-                            {gender} • {dob}
-                          </div>
-                          <div style={{ marginTop: 2 }}>
-                            <span style={{ opacity: 0.75 }}>Identifier:</span> {identifier}
-                          </div>
-                        </div>
+              {patients.map((p) => {
+                const active = selectedPatient?.id === p.id;
+                return (
+                  <div key={p.id} style={ui.patientCard(active)} onClick={() => onSelect(p)}>
+                    <div style={ui.rowBetween}>
+                      <div>
+                        <div style={ui.patientName}>{pickPatientName(p)}</div>
+                        <div style={ui.meta}>Patient/{p.id}</div>
+                        <div style={{ ...ui.meta, marginTop: 6 }}>📞 Phone: {pickPhone(p)}</div>
                       </div>
 
-                      {(phone || email) && (
-                        <div style={{ marginTop: 10, fontSize: 12, color: "rgba(11,27,43,0.75)" }}>
-                          {phone && (
-                            <span style={{ marginRight: 12 }}>
-                              📞 <span style={{ opacity: 0.75 }}>Phone:</span> {phone}
-                            </span>
-                          )}
-                          {email && (
-                            <span>
-                              ✉️ <span style={{ opacity: 0.75 }}>Email:</span> {email}
-                            </span>
-                          )}
+                      <div style={ui.rightMeta}>
+                        <div style={{ fontWeight: 900 }}>
+                          {p.gender || "unknown"} • {p.birthDate || "—"}
                         </div>
-                      )}
-                    </button>
-                  );
-                })}
-
-                {!loadingPatients && patients.length === 0 && !errorPatients && (
-                  <div style={{ opacity: 0.75 }}>No patients returned.</div>
-                )}
-              </div>
-            </section>
-
-            {/* RIGHT: patient details + observations */}
-            <aside style={{ position: "sticky", top: 16, alignSelf: "start" }}>
-              <div style={{ ...ui.card, padding: 14 }}>
-                <h2 style={{ margin: 0, fontSize: 16, letterSpacing: 0.2 }}>Patient details</h2>
-
-                {!selectedPatient && (
-                  <div style={{ marginTop: 10, color: "rgba(11,27,43,0.75)" }}>Select a patient to view details.</div>
-                )}
-
-                {selectedPatient && (
-                  <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-                    <div>
-                      <div style={{ fontSize: 18, fontWeight: 950 }}>{getHumanName(selectedPatient.name)}</div>
-                      <div style={{ fontSize: 12, color: "rgba(11,27,43,0.70)", marginTop: 2 }}>
-                        <code>Patient/{selectedPatient.id}</code>
-                      </div>
-                    </div>
-
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                      <div style={{ ...ui.pill, justifyContent: "space-between" }}>
-                        <span style={{ opacity: 0.75 }}>Gender</span>
-                        <span>{selectedPatient.gender || "unknown"}</span>
-                      </div>
-                      <div style={{ ...ui.pill, justifyContent: "space-between" }}>
-                        <span style={{ opacity: 0.75 }}>Date of birth</span>
-                        <span>{selectedPatient.birthDate || "—"}</span>
-                      </div>
-                    </div>
-
-                    {/* Observations section */}
-                    <div
-                      style={{
-                        marginTop: 2,
-                        padding: 12,
-                        borderRadius: 16,
-                        border: "1px solid rgba(10,30,60,0.10)",
-                        background:
-                          "linear-gradient(180deg, rgba(250,252,255,1), rgba(245,249,255,1))",
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
-                        <div style={{ fontSize: 14, fontWeight: 950 }}>Observations (vitals / labs)</div>
-                        <div style={{ fontSize: 12, color: "rgba(11,27,43,0.65)" }}>
-                          {loadingObs ? "Loading…" : `${observations.length} items`}
+                        <div style={{ marginTop: 4, opacity: 0.7 }}>
+                          Identifier: {pickIdentifier(p)}
                         </div>
                       </div>
-
-                      {errorObs && (
-                        <div style={{ marginTop: 10, padding: 10, borderRadius: 12, background: "rgba(220,50,50,0.06)", border: "1px solid rgba(220,50,50,0.20)" }}>
-                          <strong>Observation error:</strong> {errorObs}
-                        </div>
-                      )}
-
-                      {!errorObs && (
-                        <>
-                          {/* Latest vitals */}
-                          <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                            <VitalCard label="Blood pressure" value={vitals.sbp && vitals.dbp ? `${vitals.sbp.value} / ${vitals.dbp.value}` : "—"} when={fmtDate(pickObsDate(vitals.sbp?.obs || vitals.dbp?.obs))} />
-                            <VitalCard label="Heart rate" value={vitals.hr?.value || "—"} when={fmtDate(pickObsDate(vitals.hr?.obs))} />
-                            <VitalCard label="Temperature" value={vitals.temp?.value || "—"} when={fmtDate(pickObsDate(vitals.temp?.obs))} />
-                            <VitalCard label="Oxygen saturation" value={vitals.spo2?.value || "—"} when={fmtDate(pickObsDate(vitals.spo2?.obs))} />
-                          </div>
-
-                          {/* Mini timeline */}
-                          <div style={{ marginTop: 12 }}>
-                            <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(11,27,43,0.70)", marginBottom: 6 }}>
-                              Recent timeline
-                            </div>
-
-                            <div style={{ display: "grid", gap: 8 }}>
-                              {observations.slice(0, 8).map((o) => {
-                                const cd = getCodingCodeDisplay(o.code);
-                                const dt = fmtDate(pickObsDate(o));
-                                const val = getObsValueText(o);
-
-                                // If BP panel, show SBP/DBP
-                                let lineVal = val;
-                                if (cd.code === LOINC.BP_PANEL) {
-                                  const comps = safeArr(o.component);
-                                  const s = comps.find((c) => getCodingCodeDisplay(c?.code).code === LOINC.SBP);
-                                  const d = comps.find((c) => getCodingCodeDisplay(c?.code).code === LOINC.DBP);
-                                  const sv = s?.valueQuantity ? getObsValueText({ valueQuantity: s.valueQuantity }) : null;
-                                  const dv = d?.valueQuantity ? getObsValueText({ valueQuantity: d.valueQuantity }) : null;
-                                  if (sv || dv) lineVal = `${sv || "—"} / ${dv || "—"}`;
-                                }
-
-                                const label = cd.display || o.code?.text || "Observation";
-                                return (
-                                  <div
-                                    key={o.id}
-                                    style={{
-                                      padding: 10,
-                                      borderRadius: 14,
-                                      background: "white",
-                                      border: "1px solid rgba(10,30,60,0.10)",
-                                      display: "flex",
-                                      justifyContent: "space-between",
-                                      gap: 10,
-                                      alignItems: "baseline",
-                                    }}
-                                  >
-                                    <div style={{ minWidth: 0 }}>
-                                      <div style={{ fontSize: 12, fontWeight: 950, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                                        {label}
-                                      </div>
-                                      <div style={{ fontSize: 11, color: "rgba(11,27,43,0.62)", marginTop: 2 }}>
-                                        {dt}
-                                      </div>
-                                    </div>
-                                    <div style={{ fontSize: 12, fontWeight: 950 }}>{lineVal}</div>
-                                  </div>
-                                );
-                              })}
-
-                              {!loadingObs && observations.length === 0 && (
-                                <div style={{ marginTop: 6, color: "rgba(11,27,43,0.72)", fontSize: 12 }}>
-                                  No Observations returned for this patient (that’s normal on public test data sometimes).
-                                </div>
-                              )}
-                            </div>
-                          </div>
-
-                          <div style={{ marginTop: 12, fontSize: 12, color: "rgba(11,27,43,0.70)" }}>
-                            Next upgrade: add an <strong>AI summary</strong> button that produces a short clinical narrative from these Observations.
-                          </div>
-                        </>
-                      )}
                     </div>
                   </div>
-                )}
-              </div>
-            </aside>
-          </div>
+                );
+              })}
 
-          <div style={{ marginTop: 10, textAlign: "center", fontSize: 12, color: "rgba(11,27,43,0.65)" }}>
-            Built for demo purposes using public test FHIR data. No real patient data.
+              {!loadingPatients && patients.length === 0 && (
+                <div style={{ opacity: 0.75 }}>No patients returned.</div>
+              )}
+            </div>
+
+            {/* RIGHT: Patient details */}
+            <div style={{ ...ui.card, padding: 14 }}>
+              <div style={{ textAlign: "center", fontWeight: 900 }}>Patient details</div>
+
+              {!selectedPatient ? (
+                <div style={{ marginTop: 12, opacity: 0.75, textAlign: "center" }}>
+                  Select a patient from the results.
+                </div>
+              ) : (
+                <>
+                  <div style={{ textAlign: "center", marginTop: 8 }}>
+                    <div style={{ fontSize: 18, fontWeight: 950 }}>
+                      {pickPatientName(selectedPatient)}
+                    </div>
+                    <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
+                      Patient/{selectedPatient.id}
+                    </div>
+                  </div>
+
+                  <div style={ui.grid2}>
+                    <div style={ui.pill}>
+                      <span style={{ opacity: 0.7 }}>Gender</span>
+                      <span style={{ fontWeight: 950 }}>{pickGender(selectedPatient)}</span>
+                    </div>
+                    <div style={ui.pill}>
+                      <span style={{ opacity: 0.7 }}>Date of birth</span>
+                      <span style={{ fontWeight: 950 }}>{pickBirthDate(selectedPatient)}</span>
+                    </div>
+                  </div>
+
+                  <div style={{ marginTop: 12, display: "flex", justifyContent: "space-between" }}>
+                    <div style={{ fontWeight: 900 }}>Observations (vitals / labs)</div>
+                    <div style={{ fontSize: 12, opacity: 0.65 }}>
+                      {loadingObs ? "Loading…" : `${observations.length} items`}
+                    </div>
+                  </div>
+
+                  <div style={ui.vitalsGrid}>
+                    <VitalCard label="Blood pressure" obs={latest.bp} />
+                    <VitalCard label="Heart rate" obs={latest.hr} />
+                    <VitalCard label="Temperature" obs={latest.temp} />
+                    <VitalCard label="Oxygen saturation" obs={latest.spo2} />
+                  </div>
+
+                  <div style={{ marginTop: 12, fontWeight: 900, textAlign: "center" }}>
+                    Recent timeline
+                  </div>
+
+                  <div style={ui.timeline}>
+                    {observations.slice(0, 8).map((o) => (
+                      <div key={o.id} style={ui.tlItem}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={ui.tlLeft}>{getObsDisplay(o)}</div>
+                          <div style={ui.tlSub}>{formatWhen(o)}</div>
+                        </div>
+                        <div style={ui.tlRight}>{getObsValueText(o)}</div>
+                      </div>
+                    ))}
+
+                    {observations.length === 0 && (
+                      <div style={{ padding: 12, opacity: 0.75 }}>
+                        No observations returned for this patient.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* AI Summary Panel */}
+                  <div style={ui.aiBox}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                      <div style={{ fontWeight: 950 }}>AI summary (demo)</div>
+                      <button
+                        style={{
+                          ...ui.button,
+                          padding: "8px 12px",
+                          borderRadius: 10,
+                          boxShadow: "0 10px 16px rgba(11, 99, 206, 0.18)",
+                        }}
+                        onClick={onGenerateSummary}
+                        disabled={!selectedPatient}
+                      >
+                        Generate summary
+                      </button>
+                    </div>
+
+                    <div style={{ marginTop: 6, fontSize: 12, opacity: 0.7 }}>
+                      Generates a short “clinical note” from patient demographics + latest observations.
+                    </div>
+
+                    {aiSummary ? (
+                      <div style={ui.aiText}>{aiSummary}</div>
+                    ) : (
+                      <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+                        Click <b>Generate summary</b> to produce a narrative.
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
           </div>
-        </div>
+        </section>
+
+        <footer style={{ marginTop: 14, opacity: 0.65, fontSize: 12, textAlign: "center" }}>
+          Tip: after you <b>git push</b>, Cloudflare Pages will rebuild automatically if this repo is connected.
+        </footer>
       </div>
-    </div>
-  );
-}
-
-function VitalCard({ label, value, when }) {
-  return (
-    <div
-      style={{
-        padding: 10,
-        borderRadius: 14,
-        border: "1px solid rgba(10,30,60,0.10)",
-        background: "white",
-      }}
-    >
-      <div style={{ fontSize: 11, fontWeight: 900, color: "rgba(11,27,43,0.70)" }}>{label}</div>
-      <div style={{ fontSize: 16, fontWeight: 950, marginTop: 6 }}>{value}</div>
-      <div style={{ fontSize: 11, color: "rgba(11,27,43,0.60)", marginTop: 4 }}>{when}</div>
     </div>
   );
 }
